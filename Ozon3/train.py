@@ -1,67 +1,52 @@
-"""
-Обучение baseline-модели: LightGBM с Tweedie loss.
-Плюс опционально two-stage (classifier P(target>0) x regressor E[target|target>0]).
-
-Оценка на CV фолдах через time-based валидацию (см. time_split.py).
-
-Запуск:
-    python train.py --mode tweedie
-    python train.py --mode two_stage
-"""
+import gc
 import argparse
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 import config as cfg
 
 NON_FEATURE_COLS = [cfg.ID_COL, "target", "cutoff_date"]
 
 
-def rmse(y_true, y_pred):
-    return mean_squared_error(y_true, y_pred) ** 0.5
-
-
-def wape(y_true, y_pred):
-    """Weighted Absolute Percentage Error - устойчива к нулям, частая метрика для GMV."""
-    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    denom = np.abs(y_true).sum()
-    return np.abs(y_true - y_pred).sum() / denom if denom > 0 else np.nan
-
-
-def load_fold(name: str) -> pd.DataFrame:
-    return pd.read_parquet(cfg.DATA_DIR / f"{name}.parquet")
+def rmsle(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.clip(np.asarray(y_pred, dtype=np.float64), 0, None)
+    log_diff = np.log1p(y_true) - np.log1p(y_pred)
+    return float(np.sqrt(np.mean(log_diff ** 2)))
 
 
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in NON_FEATURE_COLS]
 
 
-# ---------------------------------------------------------------------------
-# Вариант 1: прямая регрессия с Tweedie loss (хороший baseline "из коробки")
-# ---------------------------------------------------------------------------
-def train_tweedie(train_df, valid_df, feature_cols, params_override=None):
+def train_log_target(train_df, valid_df, feature_cols, params_override=None):
     params = dict(
-        objective="tweedie",
-        tweedie_variance_power=1.3,  # 1.1-1.9, обычно 1.2-1.5 для GMV-подобных таргетов
+        device="cuda",
+        max_bin=127,
+        objective="regression",
         metric="rmse",
         learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=100,
+        num_leaves=96,
+        min_data_in_leaf=120,
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=1,
-        lambda_l2=1.0,
-        max_depth=-1,
+        lambda_l2=1.5,
         verbosity=-1,
         seed=cfg.RANDOM_STATE,
     )
     if params_override:
         params.update(params_override)
 
-    dtrain = lgb.Dataset(train_df[feature_cols], label=train_df["target"])
-    dvalid = lgb.Dataset(valid_df[feature_cols], label=valid_df["target"], reference=dtrain)
+    y_train = np.log1p(train_df["target"].clip(lower=0))
+    y_valid = np.log1p(valid_df["target"].clip(lower=0))
+
+    # Сдвиг весов в пользу платящих пользователей для минимизации ошибки RMSLE
+    weights_train = np.where(train_df["target"] > 0, 1.25, 0.85)
+
+    dtrain = lgb.Dataset(train_df[feature_cols], label=y_train, weight=weights_train)
+    dvalid = lgb.Dataset(valid_df[feature_cols], label=y_valid, reference=dtrain)
 
     model = lgb.train(
         params,
@@ -69,110 +54,96 @@ def train_tweedie(train_df, valid_df, feature_cols, params_override=None):
         num_boost_round=3000,
         valid_sets=[dtrain, dvalid],
         valid_names=["train", "valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)],
     )
     return model
 
 
-# ---------------------------------------------------------------------------
-# Вариант 2: two-stage (classification P(target>0) + regression на log1p)
-# ---------------------------------------------------------------------------
-def train_two_stage(train_df, valid_df, feature_cols):
-    y_train_bin = (train_df["target"] > 0).astype(int)
-    y_valid_bin = (valid_df["target"] > 0).astype(int)
+def predict_log_target(model, df, feature_cols):
+    pred_log = model.predict(df[feature_cols])
+    return np.clip(np.expm1(pred_log), 0, None)
 
-    clf_params = dict(
-        objective="binary",
-        metric="auc",
-        learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=100,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
-    )
-    dtrain_clf = lgb.Dataset(train_df[feature_cols], label=y_train_bin)
-    dvalid_clf = lgb.Dataset(valid_df[feature_cols], label=y_valid_bin, reference=dtrain_clf)
-    clf = lgb.train(
-        clf_params, dtrain_clf, num_boost_round=2000,
-        valid_sets=[dvalid_clf], valid_names=["valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
-    )
 
-    # регрессия только на положительных таргетах, в log1p-пространстве
-    pos_train = train_df[train_df["target"] > 0]
-    pos_valid = valid_df[valid_df["target"] > 0]
-
-    reg_params = dict(
+def train_log_target_fixed_rounds(train_df, feature_cols, num_boost_round, params_override=None):
+    params = dict(
+        device="cuda",
+        max_bin=127,
         objective="regression",
         metric="rmse",
         learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=50,
+        num_leaves=96,
+        min_data_in_leaf=120,
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=1,
-        lambda_l2=1.0,
+        lambda_l2=1.5,
         verbosity=-1,
         seed=cfg.RANDOM_STATE,
     )
-    dtrain_reg = lgb.Dataset(pos_train[feature_cols], label=np.log1p(pos_train["target"]))
-    dvalid_reg = lgb.Dataset(pos_valid[feature_cols], label=np.log1p(pos_valid["target"]), reference=dtrain_reg)
-    reg = lgb.train(
-        reg_params, dtrain_reg, num_boost_round=2000,
-        valid_sets=[dvalid_reg], valid_names=["valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
-    )
-    return clf, reg
+    if params_override:
+        params.update(params_override)
+
+    y_train = np.log1p(train_df["target"].clip(lower=0))
+    weights_train = np.where(train_df["target"] > 0, 1.25, 0.85)
+
+    dtrain = lgb.Dataset(train_df[feature_cols], label=y_train, weight=weights_train)
+    model = lgb.train(params, dtrain, num_boost_round=num_boost_round)
+    return model
 
 
-def predict_two_stage(clf, reg, df, feature_cols, threshold=0.5):
-    p_buy = clf.predict(df[feature_cols])
-    pred_amount = np.expm1(reg.predict(df[feature_cols]))
-    pred_amount = np.clip(pred_amount, 0, None)
-    # Ожидаемое значение: p(buy) * E[amount | buy]  (мягкий вариант, обычно лучше чем hard threshold)
-    return p_buy * pred_amount
+def kfold_cv_log_target(fold_frames: list[pd.DataFrame], feature_cols, params_override=None, verbose=True):
+    models, best_iterations = [], []
+    oof_true, oof_pred = [], []
+
+    n = len(fold_frames)
+    for i in range(n):
+        valid_df = fold_frames[i]
+        train_df = pd.concat([f for j, f in enumerate(fold_frames) if j != i], ignore_index=True)
+
+        model = train_log_target(train_df, valid_df, feature_cols, params_override=params_override)
+        preds = predict_log_target(model, valid_df, feature_cols)
+
+        fold_rmsle = rmsle(valid_df["target"].values, preds)
+        if verbose:
+            print(f"  [kfold_cv] fold {i}: best_iter={model.best_iteration}, valid RMSLE={fold_rmsle:.5f}")
+
+        models.append(model)
+        best_iterations.append(model.best_iteration)
+        oof_true.append(valid_df["target"].values)
+        oof_pred.append(preds)
+
+        # Очистка GPU памяти между фолдами
+        del train_df, model
+        gc.collect()
+
+    oof_true = np.concatenate(oof_true)
+    oof_pred = np.concatenate(oof_pred)
+    oof_score = rmsle(oof_true, oof_pred)
+
+    if verbose:
+        print(f"\n  [kfold_cv] OOF RMSLE: {oof_score:.5f}")
+
+    return models, best_iterations, oof_score
 
 
-def main(mode: str = "tweedie"):
-    # используем 2 последних CV фолда: предпоследний для train, последний для valid
-    # (можно расширить до полноценного k-fold, для хакатон-baseline этого достаточно)
-    fold_0 = load_fold("fold_0")
-    fold_1 = load_fold("fold_1")
-    fold_2 = load_fold("fold_2")
+def load_all_cv_folds() -> list[pd.DataFrame]:
+    paths = sorted(cfg.DATA_DIR.glob("fold_*.parquet"), key=lambda p: int(p.stem.split("_")[1]))
+    if not paths:
+        raise FileNotFoundError(f"Файлы fold_*.parquet не найдены в {cfg.DATA_DIR}.")
+    return [pd.read_parquet(p) for p in paths]
 
-    train_df = pd.concat([fold_0, fold_1], ignore_index=True)
-    valid_df = fold_2
 
-    feature_cols = get_feature_cols(train_df)
-    print(f"Число фичей: {len(feature_cols)}")
-    print(f"Train: {train_df.shape}, Valid: {valid_df.shape}")
+def main(mode: str = "log_target"):
+    fold_frames = load_all_cv_folds()
+    feature_cols = get_feature_cols(fold_frames[0])
 
-    if mode == "tweedie":
-        model = train_tweedie(train_df, valid_df, feature_cols)
-        preds = np.clip(model.predict(valid_df[feature_cols]), 0, None)
-        model.save_model(str(cfg.DATA_DIR / "model_tweedie.txt"))
-    elif mode == "two_stage":
-        clf, reg = train_two_stage(train_df, valid_df, feature_cols)
-        preds = predict_two_stage(clf, reg, valid_df, feature_cols)
-        clf.save_model(str(cfg.DATA_DIR / "model_clf.txt"))
-        reg.save_model(str(cfg.DATA_DIR / "model_reg.txt"))
-    else:
-        raise ValueError(mode)
-
-    y_true = valid_df["target"].values
-    print(f"\n=== Метрики на valid ({mode}) ===")
-    print(f"RMSE: {rmse(y_true, preds):.4f}")
-    print(f"MAE:  {mean_absolute_error(y_true, preds):.4f}")
-    print(f"WAPE: {wape(y_true, preds):.4f}")
-    print(f"Baseline (persistence, gmv_sum_30d): "
-          f"RMSE={rmse(y_true, valid_df['gmv_sum_30d']):.4f}")
+    if mode == "log_target":
+        models, best_iterations, oof_score = kfold_cv_log_target(fold_frames, feature_cols)
+        print(f"\nИтоговый OOF RMSLE: {oof_score:.5f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["tweedie", "two_stage"], default="tweedie")
+    parser.add_argument("--mode", choices=["log_target"], default="log_target")
     args = parser.parse_args()
     main(mode=args.mode)

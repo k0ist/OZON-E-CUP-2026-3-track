@@ -1,2 +1,6 @@
-data/
-.venv/
+.idea/
+__pycache__/
+*.pyc
+uploads/
+data/*.parquet
+data/*.txt

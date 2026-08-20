@@ -1,14 +1,3 @@
-"""
-Time-based валидация.
-
-Каждый фолд = (cutoff_date, target_start, target_end):
-  - фичи считаются по истории СТРОГО ДО cutoff_date (включительно)
-  - таргет = сумма gmv за [target_start, target_end] (30 дней)
-
-Схема повторяет реальный сдвиг теста, поэтому дистанция между
-cutoff и target_start везде одинаковая (1 день), а длина таргет-окна
-всегда 30 дней - это критично, чтобы CV был репрезентативен.
-"""
 from dataclasses import dataclass
 import datetime as dt
 import config as cfg
@@ -22,17 +11,7 @@ class Fold:
     target_end: dt.date      # включительно
 
 
-def build_folds(n_folds: int = 3, step_days: int = 30) -> list[Fold]:
-    """
-    Строит n_folds скользящих фолдов, заканчивающихся перед финальным тестом,
-    плюс сам финальный тест-фолд (без таргета, для сабмита).
-
-    Пример при n_folds=3, step_days=30 (окно таргета = 30 дней):
-      fold_0: cutoff=2025-11-16 -> target [2025-11-17 .. 2025-12-16]
-      fold_1: cutoff=2025-12-16 -> target [2025-12-17 .. 2026-01-15]
-      fold_2: cutoff=2026-01-15 -> target [2026-01-16 .. 2026-02-13]
-      test  : cutoff=2026-02-13 -> target [2026-02-14 .. 2026-03-15]  (сдаём)
-    """
+def build_folds(n_folds: int = 6, step_days: int = 20) -> list[Fold]:
     folds = []
     # идём от теста назад
     cutoff = cfg.HIST_END
@@ -42,11 +21,19 @@ def build_folds(n_folds: int = 3, step_days: int = 30) -> list[Fold]:
     # сначала добавим тестовый "фолд" (таргета для него у нас нет)
     test_fold = Fold("test", cutoff, target_start, target_end)
 
+    # ВАЖНО: самый "свежий" CV-фолд обязан оставлять ровно TARGET_LEN_DAYS дней
+    # ДО HIST_END для таргета - иначе (если step_days < TARGET_LEN_DAYS) таргет
+    # для него уйдёт за пределы истории и будет тихо обрезан build_target'ом.
+    # Поэтому первый шаг = TARGET_LEN_DAYS, а дальше уже шагаем по step_days.
     cv_folds = []
-    cur_cutoff = cutoff - dt.timedelta(days=step_days)
+    cur_cutoff = cutoff - dt.timedelta(days=cfg.TARGET_LEN_DAYS)
     for i in range(n_folds):
         t_start = cur_cutoff + dt.timedelta(days=1)
         t_end = t_start + dt.timedelta(days=cfg.TARGET_LEN_DAYS - 1)
+        assert t_end <= cfg.HIST_END, (
+            f"fold_{n_folds - 1 - i}: target_end={t_end} выходит за пределы истории "
+            f"({cfg.HIST_END}) - таргет был бы обрезан. Это баг в build_folds."
+        )
         cv_folds.append(Fold(f"fold_{n_folds - 1 - i}", cur_cutoff, t_start, t_end))
         cur_cutoff = cur_cutoff - dt.timedelta(days=step_days)
 

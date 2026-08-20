@@ -1,12 +1,3 @@
-"""
-Загрузка данных.
-
-ВАЖНО: данные - разреженные (строка есть только в дни с активностью).
-Мы НЕ делаем reindex на полный календарь для всех юзеров - это раздует
-30M строк до ~100M. Все временные агрегаты считаем через groupby +
-фильтрацию по датам, а "пропущенные" дни учитываем аналитически
-(gap-фичи, recency), а не материализуем их как нулевые строки.
-"""
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -21,7 +12,6 @@ def load_raw(path: str | Path = cfg.DATA_PATH) -> pd.DataFrame:
     if path.suffix == ".parquet":
         df = pd.read_parquet(path)
     elif path.suffix == ".csv":
-        # dtype-подсказки экономят память на 30M строк
         dtype_map = {c: "int32" for c in cfg.FLAG_COLS + cfg.COUNT_COLS}
         dtype_map.update({c: "float32" for c in cfg.GMV_COLS})
         df = pd.read_csv(
@@ -32,10 +22,12 @@ def load_raw(path: str | Path = cfg.DATA_PATH) -> pd.DataFrame:
     else:
         raise ValueError(f"Неизвестный формат файла: {path.suffix}")
 
-    print(f"[load_raw] строк: {len(df):,}, юзеров: {df[cfg.ID_COL].nunique():,}")
-    print(f"[load_raw] период: {df[cfg.DATE_COL].min()} .. {df[cfg.DATE_COL].max()}")
+    if not pd.api.types.is_datetime64_any_dtype(df[cfg.DATE_COL]):
+        df[cfg.DATE_COL] = pd.to_datetime(df[cfg.DATE_COL])
 
-    # компактный dtype для user_id, если это int
+    print(f"[Загрузка] строк: {len(df):,}, юзеров: {df[cfg.ID_COL].nunique():,}")
+    print(f"[Загрузка] период: {df[cfg.DATE_COL].min()} .. {df[cfg.DATE_COL].max()}")
+
     if pd.api.types.is_integer_dtype(df[cfg.ID_COL]):
         df[cfg.ID_COL] = df[cfg.ID_COL].astype("int32")
 
@@ -43,8 +35,7 @@ def load_raw(path: str | Path = cfg.DATA_PATH) -> pd.DataFrame:
     return df
 
 
-def basic_sanity_checks(df: pd.DataFrame) -> None:
-    """Быстрые проверки на старте EDA."""
+def basic_checks(df: pd.DataFrame) -> None:
     print("\n=== Sanity checks ===")
     print("Пропуски по колонкам:\n", df.isna().sum())
     print("\nДубликаты (user_id, event_date):",
@@ -65,4 +56,4 @@ def get_all_user_ids(df: pd.DataFrame) -> pd.Series:
 
 if __name__ == "__main__":
     df = load_raw()
-    basic_sanity_checks(df)
+    basic_checks(df)

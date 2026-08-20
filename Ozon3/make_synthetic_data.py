@@ -1,9 +1,9 @@
 """
-Генерирует небольшой синтетический датасет той же схемы, что и реальный,
-чтобы прогнать весь пайплайн (build_dataset -> train -> predict) и
-убедиться, что кода нет багов ДО того, как реальные данные будут загружены.
+Прописал генерацию синтетического датасета, чтобы
+прогнать всё через пайплайн и убедиться в отсутствии багов до загрузки
+реальных данных.
 
-Не для соревнования - только для smoke-теста.
+Смоук тест, короче
 """
 import numpy as np
 import pandas as pd
@@ -18,8 +18,7 @@ dates = pd.date_range(cfg.HIST_START, cfg.HIST_END, freq="D")
 
 rows = []
 for uid in range(N_USERS):
-    # у каждого юзера своя "интенсивность" активности (разреженность!)
-    p_active = rng.beta(1.5, 8)  # большинство юзеров активны редко
+    p_active = rng.beta(1.5, 8)
     active_mask = rng.random(len(dates)) < p_active
     active_dates = dates[active_mask]
     if len(active_dates) == 0:
