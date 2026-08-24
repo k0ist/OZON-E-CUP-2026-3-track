@@ -1,4 +1,5 @@
 .idea/
+catboost_info/
 __pycache__/
 *.pyc
 uploads/

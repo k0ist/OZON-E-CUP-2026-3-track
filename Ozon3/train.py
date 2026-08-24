@@ -1,149 +1,146 @@
-import gc
 import argparse
+import os
+from pathlib import Path
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 
-import config as cfg
-
-NON_FEATURE_COLS = [cfg.ID_COL, "target", "cutoff_date"]
+DATA_DIR = Path("data")
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def rmsle(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=np.float64)
-    y_pred = np.clip(np.asarray(y_pred, dtype=np.float64), 0, None)
-    log_diff = np.log1p(y_true) - np.log1p(y_pred)
-    return float(np.sqrt(np.mean(log_diff ** 2)))
+    y_true_clean = np.clip(y_true, 0, None)
+    y_pred_clean = np.clip(y_pred, 0, None)
+    return float(np.sqrt(np.mean((np.log1p(y_pred_clean) - np.log1p(y_true_clean)) ** 2)))
 
 
-def get_feature_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in NON_FEATURE_COLS]
+def load_all_cv_folds():
+    fold_files = sorted(list(DATA_DIR.glob("fold_*.parquet")))
+    if not fold_files:
+        raise FileNotFoundError(
+            f"Не найдено ни одного файла fold_*.parquet в {DATA_DIR.resolve()}. Сначала запустите build_dataset.py!"
+        )
+    print(f"Загрузка {len(fold_files)} фолдов из {DATA_DIR}...")
+    folds = [pd.read_parquet(f) for f in fold_files]
+    return folds
 
 
-def train_log_target(train_df, valid_df, feature_cols, params_override=None):
-    params = dict(
-        device="cuda",
-        max_bin=127,
-        objective="regression",
-        metric="rmse",
-        learning_rate=0.03,
-        num_leaves=96,
-        min_data_in_leaf=120,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        lambda_l2=1.5,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
-    )
-    if params_override:
-        params.update(params_override)
-
-    y_train = np.log1p(train_df["target"].clip(lower=0))
-    y_valid = np.log1p(valid_df["target"].clip(lower=0))
-
-    # Сдвиг весов в пользу платящих пользователей для минимизации ошибки RMSLE
-    weights_train = np.where(train_df["target"] > 0, 1.25, 0.85)
-
-    dtrain = lgb.Dataset(train_df[feature_cols], label=y_train, weight=weights_train)
-    dvalid = lgb.Dataset(valid_df[feature_cols], label=y_valid, reference=dtrain)
-
-    model = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=3000,
-        valid_sets=[dtrain, dvalid],
-        valid_names=["train", "valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)],
-    )
-    return model
-
-
-def predict_log_target(model, df, feature_cols):
-    pred_log = model.predict(df[feature_cols])
-    return np.clip(np.expm1(pred_log), 0, None)
-
-
-def train_log_target_fixed_rounds(train_df, feature_cols, num_boost_round, params_override=None):
-    params = dict(
-        device="cuda",
-        max_bin=127,
-        objective="regression",
-        metric="rmse",
-        learning_rate=0.03,
-        num_leaves=96,
-        min_data_in_leaf=120,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        lambda_l2=1.5,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
-    )
-    if params_override:
-        params.update(params_override)
-
-    y_train = np.log1p(train_df["target"].clip(lower=0))
-    weights_train = np.where(train_df["target"] > 0, 1.25, 0.85)
-
-    dtrain = lgb.Dataset(train_df[feature_cols], label=y_train, weight=weights_train)
-    model = lgb.train(params, dtrain, num_boost_round=num_boost_round)
-    return model
-
-
-def kfold_cv_log_target(fold_frames: list[pd.DataFrame], feature_cols, params_override=None, verbose=True):
-    models, best_iterations = [], []
-    oof_true, oof_pred = [], []
-
-    n = len(fold_frames)
-    for i in range(n):
-        valid_df = fold_frames[i]
-        train_df = pd.concat([f for j, f in enumerate(fold_frames) if j != i], ignore_index=True)
-
-        model = train_log_target(train_df, valid_df, feature_cols, params_override=params_override)
-        preds = predict_log_target(model, valid_df, feature_cols)
-
-        fold_rmsle = rmsle(valid_df["target"].values, preds)
-        if verbose:
-            print(f"  [kfold_cv] fold {i}: best_iter={model.best_iteration}, valid RMSLE={fold_rmsle:.5f}")
-
-        models.append(model)
-        best_iterations.append(model.best_iteration)
-        oof_true.append(valid_df["target"].values)
-        oof_pred.append(preds)
-
-        # Очистка GPU памяти между фолдами
-        del train_df, model
-        gc.collect()
-
-    oof_true = np.concatenate(oof_true)
-    oof_pred = np.concatenate(oof_pred)
-    oof_score = rmsle(oof_true, oof_pred)
-
-    if verbose:
-        print(f"\n  [kfold_cv] OOF RMSLE: {oof_score:.5f}")
-
-    return models, best_iterations, oof_score
-
-
-def load_all_cv_folds() -> list[pd.DataFrame]:
-    paths = sorted(cfg.DATA_DIR.glob("fold_*.parquet"), key=lambda p: int(p.stem.split("_")[1]))
-    if not paths:
-        raise FileNotFoundError(f"Файлы fold_*.parquet не найдены в {cfg.DATA_DIR}.")
-    return [pd.read_parquet(p) for p in paths]
-
-
-def main(mode: str = "log_target"):
+def train_log_target_lgb(device="cpu"):
     fold_frames = load_all_cv_folds()
-    feature_cols = get_feature_cols(fold_frames[0])
+    num_folds = len(fold_frames)
 
+    exclude_cols = {
+        "user_id",
+        "target",
+        "target_log",
+        "fold",
+        "cutoff_date",
+        "first_order_dt",
+        "last_order_dt",
+    }
+    feature_cols = [c for c in fold_frames[0].columns if c not in exclude_cols]
+
+    print(f"\n--- Starting K-Fold CV ({device.upper()} Mode) ---")
+    print(f"Number of features: {len(feature_cols)}")
+
+    lgb_device = "cuda" if device in ["gpu", "cuda"] else "cpu"
+
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+        "learning_rate": 0.03,
+        "num_leaves": 63,
+        "max_depth": -1,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "min_child_samples": 50,
+        "verbose": -1,
+        "n_jobs": -1,
+        "device": lgb_device,
+    }
+
+    oof_preds = []
+    targets = []
+
+    for val_fold_idx in range(num_folds):
+        val_df = fold_frames[val_fold_idx]
+        train_df = pd.concat(
+            [fold_frames[i] for i in range(num_folds) if i != val_fold_idx],
+            ignore_index=True,
+        )
+
+        X_train, y_train = train_df[feature_cols], train_df["target_log"]
+        X_val, y_val = val_df[feature_cols], val_df["target_log"]
+
+        train_data = lgb.Dataset(X_train, label=y_train)
+        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+
+        callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)]
+
+        try:
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=1500,
+                valid_sets=[train_data, val_data],
+                callbacks=callbacks,
+            )
+        except Exception as e:
+            if lgb_device != "cpu":
+                print(f"[Предупреждение] Ошибка GPU ({e}). Переключение на CPU...")
+                params["device"] = "cpu"
+                model = lgb.train(
+                    params,
+                    train_data,
+                    num_boost_round=1500,
+                    valid_sets=[train_data, val_data],
+                    callbacks=callbacks,
+                )
+            else:
+                raise e
+
+        val_preds_log = model.predict(X_val)
+        val_preds_gmv = np.expm1(np.clip(val_preds_log, 0, None))
+
+        fold_rmsle = rmsle(val_df["target"].values, val_preds_gmv)
+        print(f"Fold {val_fold_idx} RMSLE (GMV): {fold_rmsle:.5f}")
+
+        oof_preds.extend(val_preds_gmv)
+        targets.extend(val_df["target"].values)
+
+        model_path = MODELS_DIR / f"model_fold_{val_fold_idx}.txt"
+        model.save_model(str(model_path))
+
+    overall_rmsle = rmsle(np.array(targets), np.array(oof_preds))
+    print("\n" + "=" * 40)
+    print(f"ИТОГОВЫЙ OOF RMSLE (Log-Target LightGBM): {overall_rmsle:.5f}")
+    print("=" * 40)
+
+
+def main(mode, device):
     if mode == "log_target":
-        models, best_iterations, oof_score = kfold_cv_log_target(fold_frames, feature_cols)
-        print(f"\nИтоговый OOF RMSLE: {oof_score:.5f}")
+        train_log_target_lgb(device=device)
+    else:
+        raise ValueError(f"Неизвестный режим: {mode}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["log_target"], default="log_target")
+    parser = argparse.ArgumentParser(description="Обучение моделей LightGBM")
+    parser.add_argument(
+        "--mode",
+        choices=["log_target"],
+        default="log_target",
+        help="Режим обучения",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "gpu", "cuda"],
+        default="cpu",
+        help="Устройство для вычислений (cpu, gpu или cuda)",
+    )
     args = parser.parse_args()
-    main(mode=args.mode)
+    main(mode=args.mode, device=args.device)
