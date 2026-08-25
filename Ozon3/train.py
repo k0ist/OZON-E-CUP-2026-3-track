@@ -1,37 +1,95 @@
 import argparse
-import os
+import json
 from pathlib import Path
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path("data")
-MODELS_DIR = Path("models")
+import config as cfg
+
+DATA_DIR = cfg.DATA_DIR
+MODELS_DIR = cfg.DATA_DIR / "models"
+OOF_DIR = cfg.DATA_DIR / "oof"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+OOF_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def rmsle(y_true, y_pred):
-    y_true_clean = np.clip(y_true, 0, None)
-    y_pred_clean = np.clip(y_pred, 0, None)
-    return float(np.sqrt(np.mean((np.log1p(y_pred_clean) - np.log1p(y_true_clean)) ** 2)))
+def load_best_params():
+    path = DATA_DIR / "best_params.json"
+    if path.exists():
+        with open(path) as f:
+            params = json.load(f)
+        print(f"[train] загружены гиперпараметры из tune.py: {path}")
+        return params
+    return None
 
 
-def load_all_cv_folds():
-    fold_files = sorted(list(DATA_DIR.glob("fold_*.parquet")))
-    if not fold_files:
-        raise FileNotFoundError(
-            f"Не найдено ни одного файла fold_*.parquet в {DATA_DIR.resolve()}. Сначала запустите build_dataset.py!"
+def rmsle(
+    y_true,
+    y_pred,
+):
+
+    y_true = np.clip(
+        y_true,
+        0,
+        None,
+    )
+
+    y_pred = np.clip(
+        y_pred,
+        0,
+        None,
+    )
+
+    return float(
+        np.sqrt(
+            np.mean(
+                (
+                    np.log1p(y_pred)
+                    - np.log1p(y_true)
+                )
+                ** 2
+            )
         )
-    print(f"Загрузка {len(fold_files)} фолдов из {DATA_DIR}...")
-    folds = [pd.read_parquet(f) for f in fold_files]
+    )
+
+
+def load_folds():
+
+    files = sorted(
+        DATA_DIR.glob(
+            "fold_*.parquet"
+        )
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            "Нет fold_*.parquet. "
+            "Сначала запусти build_dataset.py"
+        )
+
+    folds = []
+
+    for f in files:
+
+        df = pd.read_parquet(f)
+
+        print(
+            f"{f.name}: "
+            f"{len(df):,} строк"
+        )
+
+        folds.append(df)
+
     return folds
 
 
-def train_log_target_lgb(device="cpu"):
-    fold_frames = load_all_cv_folds()
-    num_folds = len(fold_frames)
+def get_features(
+    folds,
+):
 
-    exclude_cols = {
+    exclude = {
         "user_id",
         "target",
         "target_log",
@@ -40,107 +98,413 @@ def train_log_target_lgb(device="cpu"):
         "first_order_dt",
         "last_order_dt",
     }
-    feature_cols = [c for c in fold_frames[0].columns if c not in exclude_cols]
 
-    print(f"\n--- Starting K-Fold CV ({device.upper()} Mode) ---")
-    print(f"Number of features: {len(feature_cols)}")
+    return [
+        c for c in folds[0].columns
+        if c not in exclude
+        and pd.api.types.is_numeric_dtype(
+            folds[0][c]
+        )
+    ]
 
-    lgb_device = "cuda" if device in ["gpu", "cuda"] else "cpu"
+
+def train_single_model(
+    train_df,
+    val_df,
+    feature_cols,
+    params,
+):
+
+    X_train = train_df[
+        feature_cols
+    ]
+
+    y_train = train_df[
+        "target_log"
+    ]
+
+    X_val = val_df[
+        feature_cols
+    ]
+
+    y_val = val_df[
+        "target_log"
+    ]
+
+    train_data = lgb.Dataset(
+        X_train,
+        label=y_train,
+        free_raw_data=False,
+    )
+
+    val_data = lgb.Dataset(
+        X_val,
+        label=y_val,
+        reference=train_data,
+        free_raw_data=False,
+    )
+
+    callbacks = [
+        lgb.early_stopping(
+            stopping_rounds=100,
+            verbose=False,
+        ),
+        lgb.log_evaluation(
+            period=200
+        ),
+    ]
+
+    model = lgb.train(
+        params,
+        train_data,
+        num_boost_round=5000,
+        valid_sets=[
+            train_data,
+            val_data,
+        ],
+        valid_names=[
+            "train",
+            "valid",
+        ],
+        callbacks=callbacks,
+    )
+
+    return model
+
+
+def train_temporal_cv(
+    device="cpu",
+):
+
+    folds = load_folds()
+
+    feature_cols = get_features(
+        folds
+    )
+
+    print()
+    print("=" * 70)
+    print("TEMPORAL LIGHTGBM CV")
+    print("=" * 70)
+
+    print(
+        f"Количество признаков: "
+        f"{len(feature_cols)}"
+    )
+
+    # ---------------------------------------------------------
+    # Основная конфигурация
+    # ---------------------------------------------------------
+
+    lgb_device = (
+        "cuda"
+        if device in ("gpu", "cuda")
+        else "cpu"
+    )
 
     params = {
         "objective": "regression",
         "metric": "rmse",
         "boosting_type": "gbdt",
-        "learning_rate": 0.03,
+
+        "learning_rate": 0.02,
+
         "num_leaves": 63,
         "max_depth": -1,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+
+        "min_data_in_leaf": 100,
+
+        "feature_fraction": 0.80,
+        "bagging_fraction": 0.80,
         "bagging_freq": 1,
-        "min_child_samples": 50,
-        "verbose": -1,
+
+        "lambda_l1": 0.05,
+        "lambda_l2": 1.0,
+
+        "max_bin": 255,
+
+        "verbosity": -1,
         "n_jobs": -1,
+
         "device": lgb_device,
     }
 
-    oof_preds = []
-    targets = []
+    best_params = load_best_params()
+    if best_params:
+        params.update(best_params)
 
-    for val_fold_idx in range(num_folds):
-        val_df = fold_frames[val_fold_idx]
+    oof_predictions = []
+    oof_targets = []
+    oof_ids = []
+
+    models = []
+
+    # ---------------------------------------------------------
+    # Temporal CV
+    # ---------------------------------------------------------
+
+    for val_idx in range(1, len(folds)):
+
+        val_df = folds[val_idx]
+
+        train_parts = folds[
+            :val_idx
+        ]
+
         train_df = pd.concat(
-            [fold_frames[i] for i in range(num_folds) if i != val_fold_idx],
+            train_parts,
             ignore_index=True,
         )
 
-        X_train, y_train = train_df[feature_cols], train_df["target_log"]
-        X_val, y_val = val_df[feature_cols], val_df["target_log"]
+        print()
+        print("-" * 70)
+        print(
+            f"VALIDATION FOLD: "
+            f"fold_{val_idx}"
+        )
 
-        train_data = lgb.Dataset(X_train, label=y_train)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        print(
+            f"Train: "
+            f"{len(train_df):,}"
+        )
 
-        callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)]
+        print(
+            f"Validation: "
+            f"{len(val_df):,}"
+        )
 
         try:
-            model = lgb.train(
+
+            model = train_single_model(
+                train_df,
+                val_df,
+                feature_cols,
                 params,
-                train_data,
-                num_boost_round=1500,
-                valid_sets=[train_data, val_data],
-                callbacks=callbacks,
             )
+
         except Exception as e:
+
             if lgb_device != "cpu":
-                print(f"[Предупреждение] Ошибка GPU ({e}). Переключение на CPU...")
-                params["device"] = "cpu"
-                model = lgb.train(
-                    params,
-                    train_data,
-                    num_boost_round=1500,
-                    valid_sets=[train_data, val_data],
-                    callbacks=callbacks,
+
+                print(
+                    "[WARNING] GPU "
+                    "LightGBM failed:"
                 )
+
+                print(e)
+
+                print(
+                    "Переключаемся на CPU..."
+                )
+
+                params["device"] = "cpu"
+
+                model = train_single_model(
+                    train_df,
+                    val_df,
+                    feature_cols,
+                    params,
+                )
+
             else:
-                raise e
 
-        val_preds_log = model.predict(X_val)
-        val_preds_gmv = np.expm1(np.clip(val_preds_log, 0, None))
+                raise
 
-        fold_rmsle = rmsle(val_df["target"].values, val_preds_gmv)
-        print(f"Fold {val_fold_idx} RMSLE (GMV): {fold_rmsle:.5f}")
+        pred_log = model.predict(
+            val_df[feature_cols],
+            num_iteration=model.best_iteration,
+        )
 
-        oof_preds.extend(val_preds_gmv)
-        targets.extend(val_df["target"].values)
+        pred = np.expm1(
+            np.clip(
+                pred_log,
+                0,
+                None,
+            )
+        )
 
-        model_path = MODELS_DIR / f"model_fold_{val_fold_idx}.txt"
-        model.save_model(str(model_path))
+        score = rmsle(
+            val_df["target"].values,
+            pred,
+        )
 
-    overall_rmsle = rmsle(np.array(targets), np.array(oof_preds))
-    print("\n" + "=" * 40)
-    print(f"ИТОГОВЫЙ OOF RMSLE (Log-Target LightGBM): {overall_rmsle:.5f}")
-    print("=" * 40)
+        print()
+        print(
+            f"fold_{val_idx} RMSLE = "
+            f"{score:.6f}"
+        )
+
+        print(
+            f"best_iteration = "
+            f"{model.best_iteration}"
+        )
+
+        model_path = (
+            MODELS_DIR
+            / f"model_fold_{val_idx}.txt"
+        )
+
+        model.save_model(
+            str(model_path)
+        )
+
+        print(
+            f"Модель сохранена: "
+            f"{model_path}"
+        )
+
+        oof_predictions.extend(
+            pred
+        )
+
+        oof_targets.extend(
+            val_df["target"].values
+        )
+
+        oof_ids.extend(
+            val_df["user_id"].values
+        )
+
+        models.append(model)
+
+    # ---------------------------------------------------------
+    # OOF
+    # ---------------------------------------------------------
+
+    oof_predictions = np.asarray(
+        oof_predictions
+    )
+
+    oof_targets = np.asarray(
+        oof_targets
+    )
+
+    overall = rmsle(
+        oof_targets,
+        oof_predictions,
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        f"ИТОГОВЫЙ TEMPORAL OOF RMSLE: "
+        f"{overall:.6f}"
+    )
+    print("=" * 70)
+
+    oof_df = pd.DataFrame(
+        {
+            "user_id": oof_ids,
+            "target": oof_targets,
+            "pred": oof_predictions,
+        }
+    )
+
+    oof_path = (
+        OOF_DIR
+        / "oof_lgbm.csv"
+    )
+
+    oof_df.to_csv(
+        oof_path,
+        index=False,
+    )
+
+    print(
+        f"OOF сохранён: "
+        f"{oof_path}"
+    )
+
+    # ---------------------------------------------------------
+    # Feature importance
+    # ---------------------------------------------------------
+
+    importance = np.zeros(
+        len(feature_cols)
+    )
+
+    for model in models:
+
+        importance += (
+            model.feature_importance(
+                importance_type="gain"
+            )
+        )
+
+    importance /= len(models)
+
+    fi = pd.DataFrame(
+        {
+            "feature": feature_cols,
+            "importance": importance,
+        }
+    ).sort_values(
+        "importance",
+        ascending=False,
+    )
+
+    fi_path = (
+        DATA_DIR
+        / "lgbm_feature_importances.csv"
+    )
+
+    fi.to_csv(
+        fi_path,
+        index=False,
+    )
+
+    print(
+        f"Feature importance "
+        f"сохранён: {fi_path}"
+    )
+
+    print()
+    print("Top-30 features:")
+    print(
+        fi.head(30).to_string(
+            index=False
+        )
+    )
+
+    return (
+        overall,
+        models,
+        feature_cols,
+    )
 
 
-def main(mode, device):
-    if mode == "log_target":
-        train_log_target_lgb(device=device)
-    else:
-        raise ValueError(f"Неизвестный режим: {mode}")
+def main():
 
+    parser = argparse.ArgumentParser()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Обучение моделей LightGBM")
     parser.add_argument(
         "--mode",
         choices=["log_target"],
         default="log_target",
-        help="Режим обучения",
     )
+
     parser.add_argument(
         "--device",
-        choices=["cpu", "gpu", "cuda"],
+        choices=[
+            "cpu",
+            "gpu",
+            "cuda",
+        ],
         default="cpu",
-        help="Устройство для вычислений (cpu, gpu или cuda)",
     )
+
     args = parser.parse_args()
-    main(mode=args.mode, device=args.device)
+
+    if args.mode != "log_target":
+        raise ValueError(
+            "Поддерживается только "
+            "log_target"
+        )
+
+    train_temporal_cv(
+        device=args.device
+    )
+
+
+if __name__ == "__main__":
+    main()
