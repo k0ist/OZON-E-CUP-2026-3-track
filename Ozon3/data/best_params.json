@@ -1,0 +1,12 @@
+{
+  "learning_rate": 0.02739355996842548,
+  "num_leaves": 101,
+  "max_depth": 8,
+  "min_data_in_leaf": 157,
+  "feature_fraction": 0.5009345482904891,
+  "bagging_fraction": 0.5001310561523566,
+  "bagging_freq": 3,
+  "lambda_l1": 1.1913191738259511e-08,
+  "lambda_l2": 7.430940535124211e-05,
+  "max_bin": 127
+}

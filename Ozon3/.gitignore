@@ -1,2 +1,7 @@
-data/
-.venv/
+.idea/
+catboost_info/
+__pycache__/
+*.pyc
+uploads/
+data/*.parquet
+data/*.txt

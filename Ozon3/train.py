@@ -1,178 +1,510 @@
-"""
-Обучение baseline-модели: LightGBM с Tweedie loss.
-Плюс опционально two-stage (classifier P(target>0) x regressor E[target|target>0]).
-
-Оценка на CV фолдах через time-based валидацию (см. time_split.py).
-
-Запуск:
-    python train.py --mode tweedie
-    python train.py --mode two_stage
-"""
 import argparse
+import json
+from pathlib import Path
+
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 import config as cfg
 
-NON_FEATURE_COLS = [cfg.ID_COL, "target", "cutoff_date"]
+DATA_DIR = cfg.DATA_DIR
+MODELS_DIR = cfg.DATA_DIR / "models"
+OOF_DIR = cfg.DATA_DIR / "oof"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+OOF_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def rmse(y_true, y_pred):
-    return mean_squared_error(y_true, y_pred) ** 0.5
+def load_best_params():
+    path = DATA_DIR / "best_params.json"
+    if path.exists():
+        with open(path) as f:
+            params = json.load(f)
+        print(f"[train] загружены гиперпараметры из tune.py: {path}")
+        return params
+    return None
 
 
-def wape(y_true, y_pred):
-    """Weighted Absolute Percentage Error - устойчива к нулям, частая метрика для GMV."""
-    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    denom = np.abs(y_true).sum()
-    return np.abs(y_true - y_pred).sum() / denom if denom > 0 else np.nan
+def rmsle(
+    y_true,
+    y_pred,
+):
 
-
-def load_fold(name: str) -> pd.DataFrame:
-    return pd.read_parquet(cfg.DATA_DIR / f"{name}.parquet")
-
-
-def get_feature_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in NON_FEATURE_COLS]
-
-
-# ---------------------------------------------------------------------------
-# Вариант 1: прямая регрессия с Tweedie loss (хороший baseline "из коробки")
-# ---------------------------------------------------------------------------
-def train_tweedie(train_df, valid_df, feature_cols, params_override=None):
-    params = dict(
-        objective="tweedie",
-        tweedie_variance_power=1.3,  # 1.1-1.9, обычно 1.2-1.5 для GMV-подобных таргетов
-        metric="rmse",
-        learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=100,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        lambda_l2=1.0,
-        max_depth=-1,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
+    y_true = np.clip(
+        y_true,
+        0,
+        None,
     )
-    if params_override:
-        params.update(params_override)
 
-    dtrain = lgb.Dataset(train_df[feature_cols], label=train_df["target"])
-    dvalid = lgb.Dataset(valid_df[feature_cols], label=valid_df["target"], reference=dtrain)
+    y_pred = np.clip(
+        y_pred,
+        0,
+        None,
+    )
+
+    return float(
+        np.sqrt(
+            np.mean(
+                (
+                    np.log1p(y_pred)
+                    - np.log1p(y_true)
+                )
+                ** 2
+            )
+        )
+    )
+
+
+def load_folds():
+
+    files = sorted(
+        DATA_DIR.glob(
+            "fold_*.parquet"
+        )
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            "Нет fold_*.parquet. "
+            "Сначала запусти build_dataset.py"
+        )
+
+    folds = []
+
+    for f in files:
+
+        df = pd.read_parquet(f)
+
+        print(
+            f"{f.name}: "
+            f"{len(df):,} строк"
+        )
+
+        folds.append(df)
+
+    return folds
+
+
+def get_features(
+    folds,
+):
+
+    exclude = {
+        "user_id",
+        "target",
+        "target_log",
+        "fold",
+        "cutoff_date",
+        "first_order_dt",
+        "last_order_dt",
+    }
+
+    return [
+        c for c in folds[0].columns
+        if c not in exclude
+        and pd.api.types.is_numeric_dtype(
+            folds[0][c]
+        )
+    ]
+
+
+def train_single_model(
+    train_df,
+    val_df,
+    feature_cols,
+    params,
+):
+
+    X_train = train_df[
+        feature_cols
+    ]
+
+    y_train = train_df[
+        "target_log"
+    ]
+
+    X_val = val_df[
+        feature_cols
+    ]
+
+    y_val = val_df[
+        "target_log"
+    ]
+
+    train_data = lgb.Dataset(
+        X_train,
+        label=y_train,
+        free_raw_data=False,
+    )
+
+    val_data = lgb.Dataset(
+        X_val,
+        label=y_val,
+        reference=train_data,
+        free_raw_data=False,
+    )
+
+    callbacks = [
+        lgb.early_stopping(
+            stopping_rounds=100,
+            verbose=False,
+        ),
+        lgb.log_evaluation(
+            period=200
+        ),
+    ]
 
     model = lgb.train(
         params,
-        dtrain,
-        num_boost_round=3000,
-        valid_sets=[dtrain, dvalid],
-        valid_names=["train", "valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+        train_data,
+        num_boost_round=5000,
+        valid_sets=[
+            train_data,
+            val_data,
+        ],
+        valid_names=[
+            "train",
+            "valid",
+        ],
+        callbacks=callbacks,
     )
+
     return model
 
 
-# ---------------------------------------------------------------------------
-# Вариант 2: two-stage (classification P(target>0) + regression на log1p)
-# ---------------------------------------------------------------------------
-def train_two_stage(train_df, valid_df, feature_cols):
-    y_train_bin = (train_df["target"] > 0).astype(int)
-    y_valid_bin = (valid_df["target"] > 0).astype(int)
+def train_temporal_cv(
+    device="cpu",
+):
 
-    clf_params = dict(
-        objective="binary",
-        metric="auc",
-        learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=100,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
-    )
-    dtrain_clf = lgb.Dataset(train_df[feature_cols], label=y_train_bin)
-    dvalid_clf = lgb.Dataset(valid_df[feature_cols], label=y_valid_bin, reference=dtrain_clf)
-    clf = lgb.train(
-        clf_params, dtrain_clf, num_boost_round=2000,
-        valid_sets=[dvalid_clf], valid_names=["valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+    folds = load_folds()
+
+    feature_cols = get_features(
+        folds
     )
 
-    # регрессия только на положительных таргетах, в log1p-пространстве
-    pos_train = train_df[train_df["target"] > 0]
-    pos_valid = valid_df[valid_df["target"] > 0]
+    print()
+    print("=" * 70)
+    print("TEMPORAL LIGHTGBM CV")
+    print("=" * 70)
 
-    reg_params = dict(
-        objective="regression",
-        metric="rmse",
-        learning_rate=0.03,
-        num_leaves=63,
-        min_data_in_leaf=50,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        lambda_l2=1.0,
-        verbosity=-1,
-        seed=cfg.RANDOM_STATE,
+    print(
+        f"Количество признаков: "
+        f"{len(feature_cols)}"
     )
-    dtrain_reg = lgb.Dataset(pos_train[feature_cols], label=np.log1p(pos_train["target"]))
-    dvalid_reg = lgb.Dataset(pos_valid[feature_cols], label=np.log1p(pos_valid["target"]), reference=dtrain_reg)
-    reg = lgb.train(
-        reg_params, dtrain_reg, num_boost_round=2000,
-        valid_sets=[dvalid_reg], valid_names=["valid"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+
+    # ---------------------------------------------------------
+    # Основная конфигурация
+    # ---------------------------------------------------------
+
+    lgb_device = (
+        "cuda"
+        if device in ("gpu", "cuda")
+        else "cpu"
     )
-    return clf, reg
+
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+
+        "learning_rate": 0.02,
+
+        "num_leaves": 63,
+        "max_depth": -1,
+
+        "min_data_in_leaf": 100,
+
+        "feature_fraction": 0.80,
+        "bagging_fraction": 0.80,
+        "bagging_freq": 1,
+
+        "lambda_l1": 0.05,
+        "lambda_l2": 1.0,
+
+        "max_bin": 255,
+
+        "verbosity": -1,
+        "n_jobs": -1,
+
+        "device": lgb_device,
+    }
+
+    best_params = load_best_params()
+    if best_params:
+        params.update(best_params)
+
+    oof_predictions = []
+    oof_targets = []
+    oof_ids = []
+
+    models = []
+
+    # ---------------------------------------------------------
+    # Temporal CV
+    # ---------------------------------------------------------
+
+    for val_idx in range(1, len(folds)):
+
+        val_df = folds[val_idx]
+
+        train_parts = folds[
+            :val_idx
+        ]
+
+        train_df = pd.concat(
+            train_parts,
+            ignore_index=True,
+        )
+
+        print()
+        print("-" * 70)
+        print(
+            f"VALIDATION FOLD: "
+            f"fold_{val_idx}"
+        )
+
+        print(
+            f"Train: "
+            f"{len(train_df):,}"
+        )
+
+        print(
+            f"Validation: "
+            f"{len(val_df):,}"
+        )
+
+        try:
+
+            model = train_single_model(
+                train_df,
+                val_df,
+                feature_cols,
+                params,
+            )
+
+        except Exception as e:
+
+            if lgb_device != "cpu":
+
+                print(
+                    "[WARNING] GPU "
+                    "LightGBM failed:"
+                )
+
+                print(e)
+
+                print(
+                    "Переключаемся на CPU..."
+                )
+
+                params["device"] = "cpu"
+
+                model = train_single_model(
+                    train_df,
+                    val_df,
+                    feature_cols,
+                    params,
+                )
+
+            else:
+
+                raise
+
+        pred_log = model.predict(
+            val_df[feature_cols],
+            num_iteration=model.best_iteration,
+        )
+
+        pred = np.expm1(
+            np.clip(
+                pred_log,
+                0,
+                None,
+            )
+        )
+
+        score = rmsle(
+            val_df["target"].values,
+            pred,
+        )
+
+        print()
+        print(
+            f"fold_{val_idx} RMSLE = "
+            f"{score:.6f}"
+        )
+
+        print(
+            f"best_iteration = "
+            f"{model.best_iteration}"
+        )
+
+        model_path = (
+            MODELS_DIR
+            / f"model_fold_{val_idx}.txt"
+        )
+
+        model.save_model(
+            str(model_path)
+        )
+
+        print(
+            f"Модель сохранена: "
+            f"{model_path}"
+        )
+
+        oof_predictions.extend(
+            pred
+        )
+
+        oof_targets.extend(
+            val_df["target"].values
+        )
+
+        oof_ids.extend(
+            val_df["user_id"].values
+        )
+
+        models.append(model)
+
+    # ---------------------------------------------------------
+    # OOF
+    # ---------------------------------------------------------
+
+    oof_predictions = np.asarray(
+        oof_predictions
+    )
+
+    oof_targets = np.asarray(
+        oof_targets
+    )
+
+    overall = rmsle(
+        oof_targets,
+        oof_predictions,
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        f"ИТОГОВЫЙ TEMPORAL OOF RMSLE: "
+        f"{overall:.6f}"
+    )
+    print("=" * 70)
+
+    oof_df = pd.DataFrame(
+        {
+            "user_id": oof_ids,
+            "target": oof_targets,
+            "pred": oof_predictions,
+        }
+    )
+
+    oof_path = (
+        OOF_DIR
+        / "oof_lgbm.csv"
+    )
+
+    oof_df.to_csv(
+        oof_path,
+        index=False,
+    )
+
+    print(
+        f"OOF сохранён: "
+        f"{oof_path}"
+    )
+
+    # ---------------------------------------------------------
+    # Feature importance
+    # ---------------------------------------------------------
+
+    importance = np.zeros(
+        len(feature_cols)
+    )
+
+    for model in models:
+
+        importance += (
+            model.feature_importance(
+                importance_type="gain"
+            )
+        )
+
+    importance /= len(models)
+
+    fi = pd.DataFrame(
+        {
+            "feature": feature_cols,
+            "importance": importance,
+        }
+    ).sort_values(
+        "importance",
+        ascending=False,
+    )
+
+    fi_path = (
+        DATA_DIR
+        / "lgbm_feature_importances.csv"
+    )
+
+    fi.to_csv(
+        fi_path,
+        index=False,
+    )
+
+    print(
+        f"Feature importance "
+        f"сохранён: {fi_path}"
+    )
+
+    print()
+    print("Top-30 features:")
+    print(
+        fi.head(30).to_string(
+            index=False
+        )
+    )
+
+    return (
+        overall,
+        models,
+        feature_cols,
+    )
 
 
-def predict_two_stage(clf, reg, df, feature_cols, threshold=0.5):
-    p_buy = clf.predict(df[feature_cols])
-    pred_amount = np.expm1(reg.predict(df[feature_cols]))
-    pred_amount = np.clip(pred_amount, 0, None)
-    # Ожидаемое значение: p(buy) * E[amount | buy]  (мягкий вариант, обычно лучше чем hard threshold)
-    return p_buy * pred_amount
+def main():
 
+    parser = argparse.ArgumentParser()
 
-def main(mode: str = "tweedie"):
-    # используем 2 последних CV фолда: предпоследний для train, последний для valid
-    # (можно расширить до полноценного k-fold, для хакатон-baseline этого достаточно)
-    fold_0 = load_fold("fold_0")
-    fold_1 = load_fold("fold_1")
-    fold_2 = load_fold("fold_2")
+    parser.add_argument(
+        "--mode",
+        choices=["log_target"],
+        default="log_target",
+    )
 
-    train_df = pd.concat([fold_0, fold_1], ignore_index=True)
-    valid_df = fold_2
+    parser.add_argument(
+        "--device",
+        choices=[
+            "cpu",
+            "gpu",
+            "cuda",
+        ],
+        default="cpu",
+    )
 
-    feature_cols = get_feature_cols(train_df)
-    print(f"Число фичей: {len(feature_cols)}")
-    print(f"Train: {train_df.shape}, Valid: {valid_df.shape}")
+    args = parser.parse_args()
 
-    if mode == "tweedie":
-        model = train_tweedie(train_df, valid_df, feature_cols)
-        preds = np.clip(model.predict(valid_df[feature_cols]), 0, None)
-        model.save_model(str(cfg.DATA_DIR / "model_tweedie.txt"))
-    elif mode == "two_stage":
-        clf, reg = train_two_stage(train_df, valid_df, feature_cols)
-        preds = predict_two_stage(clf, reg, valid_df, feature_cols)
-        clf.save_model(str(cfg.DATA_DIR / "model_clf.txt"))
-        reg.save_model(str(cfg.DATA_DIR / "model_reg.txt"))
-    else:
-        raise ValueError(mode)
+    if args.mode != "log_target":
+        raise ValueError(
+            "Поддерживается только "
+            "log_target"
+        )
 
-    y_true = valid_df["target"].values
-    print(f"\n=== Метрики на valid ({mode}) ===")
-    print(f"RMSE: {rmse(y_true, preds):.4f}")
-    print(f"MAE:  {mean_absolute_error(y_true, preds):.4f}")
-    print(f"WAPE: {wape(y_true, preds):.4f}")
-    print(f"Baseline (persistence, gmv_sum_30d): "
-          f"RMSE={rmse(y_true, valid_df['gmv_sum_30d']):.4f}")
+    train_temporal_cv(
+        device=args.device
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["tweedie", "two_stage"], default="tweedie")
-    args = parser.parse_args()
-    main(mode=args.mode)
+    main()

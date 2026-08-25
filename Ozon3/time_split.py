@@ -1,66 +1,124 @@
-"""
-Time-based валидация.
-
-Каждый фолд = (cutoff_date, target_start, target_end):
-  - фичи считаются по истории СТРОГО ДО cutoff_date (включительно)
-  - таргет = сумма gmv за [target_start, target_end] (30 дней)
-
-Схема повторяет реальный сдвиг теста, поэтому дистанция между
-cutoff и target_start везде одинаковая (1 день), а длина таргет-окна
-всегда 30 дней - это критично, чтобы CV был репрезентативен.
-"""
-from dataclasses import dataclass
 import datetime as dt
+from dataclasses import dataclass
+
 import config as cfg
 
 
 @dataclass
 class Fold:
     name: str
-    cutoff: dt.date          # включительно, последний день истории
+    cutoff: dt.date
     target_start: dt.date
-    target_end: dt.date      # включительно
+    target_end: dt.date
 
 
-def build_folds(n_folds: int = 3, step_days: int = 30) -> list[Fold]:
-    """
-    Строит n_folds скользящих фолдов, заканчивающихся перед финальным тестом,
-    плюс сам финальный тест-фолд (без таргета, для сабмита).
+def _ensure_date(d: dt.date | str) -> dt.date:
+    if isinstance(d, dt.datetime):
+        return d.date()
 
-    Пример при n_folds=3, step_days=30 (окно таргета = 30 дней):
-      fold_0: cutoff=2025-11-16 -> target [2025-11-17 .. 2025-12-16]
-      fold_1: cutoff=2025-12-16 -> target [2025-12-17 .. 2026-01-15]
-      fold_2: cutoff=2026-01-15 -> target [2026-01-16 .. 2026-02-13]
-      test  : cutoff=2026-02-13 -> target [2026-02-14 .. 2026-03-15]  (сдаём)
-    """
-    folds = []
-    # идём от теста назад
-    cutoff = cfg.HIST_END
-    target_start = cfg.TARGET_START
-    target_end = cfg.TARGET_END
+    if hasattr(d, "date") and not isinstance(d, dt.date):
+        return d.date()
 
-    # сначала добавим тестовый "фолд" (таргета для него у нас нет)
-    test_fold = Fold("test", cutoff, target_start, target_end)
+    if isinstance(d, str):
+        return dt.datetime.strptime(d, "%Y-%m-%d").date()
 
-    cv_folds = []
-    cur_cutoff = cutoff - dt.timedelta(days=step_days)
-    for i in range(n_folds):
-        t_start = cur_cutoff + dt.timedelta(days=1)
-        t_end = t_start + dt.timedelta(days=cfg.TARGET_LEN_DAYS - 1)
-        cv_folds.append(Fold(f"fold_{n_folds - 1 - i}", cur_cutoff, t_start, t_end))
-        cur_cutoff = cur_cutoff - dt.timedelta(days=step_days)
+    return d
 
-    cv_folds = cv_folds[::-1]  # по возрастанию времени
 
-    for f in cv_folds:
-        assert f.cutoff >= cfg.HIST_START, (
-            f"Фолд {f.name} уходит раньше начала истории ({f.cutoff} < {cfg.HIST_START}). "
-            "Уменьши n_folds или step_days."
+def build_folds(
+    n_folds: int = 6,
+    step_days: int | None = None,
+) -> list[Fold]:
+
+    hist_end = _ensure_date(cfg.HIST_END)
+    hist_start = _ensure_date(cfg.HIST_START)
+
+    target_len = cfg.TARGET_LEN_DAYS
+
+    # Для временной CV лучше не допускать пересечения target-периодов.
+    if step_days is None:
+        step_days = target_len
+
+    if step_days < target_len:
+        raise ValueError(
+            f"step_days={step_days} меньше длины target={target_len}. "
+            "Это приводит к перекрытию target-периодов."
         )
 
-    return cv_folds + [test_fold]
+    # Последний CV cutoff должен быть непосредственно перед
+    # последним известным target-периодом.
+    current_cutoff = hist_end - dt.timedelta(days=target_len)
+
+    raw_folds = []
+
+    for _ in range(n_folds):
+        target_start = current_cutoff + dt.timedelta(days=1)
+        target_end = current_cutoff + dt.timedelta(days=target_len)
+
+        if current_cutoff < hist_start:
+            break
+
+        if target_end > hist_end:
+            raise ValueError(
+                f"Target {target_start}..{target_end} выходит "
+                f"за HIST_END={hist_end}"
+            )
+
+        raw_folds.append(
+            (
+                current_cutoff,
+                target_start,
+                target_end,
+            )
+        )
+
+        current_cutoff -= dt.timedelta(days=step_days)
+
+    # От старого к новому
+    raw_folds.reverse()
+
+    folds = []
+
+    for i, (cutoff, target_start, target_end) in enumerate(raw_folds):
+        folds.append(
+            Fold(
+                name=f"fold_{i}",
+                cutoff=cutoff,
+                target_start=target_start,
+                target_end=target_end,
+            )
+        )
+
+    # Проверяем отсутствие пересечения target-периодов
+    for i in range(1, len(folds)):
+        prev = folds[i - 1]
+        cur = folds[i]
+
+        if cur.target_start <= prev.target_end:
+            raise AssertionError(
+                f"Пересечение target-периодов: "
+                f"{prev.name}={prev.target_start}..{prev.target_end}, "
+                f"{cur.name}={cur.target_start}..{cur.target_end}"
+            )
+
+    # Test-фолд
+    test_fold = Fold(
+        name="test",
+        cutoff=hist_end,
+        target_start=_ensure_date(cfg.TARGET_START),
+        target_end=_ensure_date(cfg.TARGET_END),
+    )
+
+    return folds + [test_fold]
 
 
 if __name__ == "__main__":
-    for f in build_folds(n_folds=3):
-        print(f)
+
+    folds = build_folds(n_folds=6)
+
+    for fold in folds:
+        print(
+            f"{fold.name}: "
+            f"cutoff={fold.cutoff} | "
+            f"target={fold.target_start}..{fold.target_end}"
+        )

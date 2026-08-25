@@ -1,18 +1,9 @@
-"""
-Построение фичей на юзер-уровне относительно cutoff-даты.
-
-Все фичи считаются ТОЛЬКО по строкам с event_date <= cutoff.
-Это гарантирует отсутствие лика из таргет-периода.
-
-Данные разреженные -> вместо reindex на полный календарь используем:
-  - groupby + агрегации по срезам [cutoff - lookback + 1, cutoff]
-  - gap-фичи через diff() дат внутри groupby('user_id')
-  - recency = (cutoff - last_active_date).days
-"""
-import numpy as np
-import pandas as pd
 import datetime as dt
 
+import numpy as np
+import pandas as pd
+
+from btyd_features import calculate_btyd_features
 import config as cfg
 
 
@@ -20,146 +11,533 @@ def _to_ts(d: dt.date) -> pd.Timestamp:
     return pd.Timestamp(d)
 
 
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+
+    for col in df.columns:
+
+        if col in (cfg.ID_COL, "cutoff_date"):
+            continue
+
+        if pd.api.types.is_float_dtype(df[col]):
+            df[col] = df[col].astype("float32")
+
+        elif pd.api.types.is_integer_dtype(df[col]):
+            # Не трогаем user_id
+            df[col] = df[col].astype("int32")
+
+    return df
+
+
+def safe_div(a, b):
+    return a / np.maximum(b, 1e-6)
+
+
 def build_features_for_cutoff(
     df: pd.DataFrame,
     cutoff: dt.date,
     user_ids: pd.Series | None = None,
 ) -> pd.DataFrame:
-    """
-    df: полный сырой лог (event_date, user_id, ...)
-    cutoff: последняя допустимая дата истории (включительно)
-    user_ids: список юзеров, для которых нужно построить фичи
-              (если None - берём всех, кто встречался в истории до cutoff)
 
-    Возвращает DataFrame с одной строкой на user_id и набором фичей.
-    """
     cutoff_ts = _to_ts(cutoff)
-    hist = df[df[cfg.DATE_COL] <= cutoff_ts]
+
+    hist = df[df[cfg.DATE_COL] <= cutoff_ts].copy()
+
+    # ---------------------------------------------------------
+    # 0. Пользователи, существовавшие к cutoff
+    # ---------------------------------------------------------
 
     if user_ids is None:
-        user_ids = hist[cfg.ID_COL].drop_duplicates()
 
-    base = pd.DataFrame({cfg.ID_COL: user_ids.values}).drop_duplicates()
-    feats = base.copy()
+        user_ids = (
+            hist[cfg.ID_COL]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
 
-    # -----------------------------------------------------------------
-    # 1) Recency / lifetime фичи (по всей доступной истории юзера)
-    # -----------------------------------------------------------------
-    last_seen = hist.groupby(cfg.ID_COL)[cfg.DATE_COL].max().rename("last_active_date")
-    first_seen = hist.groupby(cfg.ID_COL)[cfg.DATE_COL].min().rename("first_active_date")
-    n_active_days_total = hist.groupby(cfg.ID_COL)[cfg.DATE_COL].nunique().rename("n_active_days_total")
-
-    life = pd.concat([last_seen, first_seen, n_active_days_total], axis=1).reset_index()
-    life["recency_days"] = (cutoff_ts - life["last_active_date"]).dt.days
-    life["tenure_days"] = (cutoff_ts - life["first_active_date"]).dt.days + 1
-    life["activity_density_total"] = life["n_active_days_total"] / life["tenure_days"].clip(lower=1)
-    life = life.drop(columns=["last_active_date", "first_active_date"])
-    feats = feats.merge(life, on=cfg.ID_COL, how="left")
-
-    # -----------------------------------------------------------------
-    # 2) Последняя дата покупки (recency по покупкам, не только визитам)
-    # -----------------------------------------------------------------
-    purchases = hist[hist["gmv"] > 0]
-    if len(purchases):
-        last_purch = purchases.groupby(cfg.ID_COL)[cfg.DATE_COL].max().rename("last_purchase_date")
-        purch_recency = last_purch.reset_index()
-        purch_recency["recency_purchase_days"] = (cutoff_ts - purch_recency["last_purchase_date"]).dt.days
-        purch_recency = purch_recency.drop(columns=["last_purchase_date"])
-        feats = feats.merge(purch_recency, on=cfg.ID_COL, how="left")
     else:
-        feats["recency_purchase_days"] = np.nan
 
-    # -----------------------------------------------------------------
-    # 3) Межпокупочные интервалы (frequency, для BTYD-подобных фичей)
-    # -----------------------------------------------------------------
+        # КРИТИЧЕСКИ ВАЖНО:
+        # исключаем пользователей, которые ещё не появились
+        existing_users = set(hist[cfg.ID_COL].unique())
+
+        user_ids = pd.Series(
+            [u for u in user_ids if u in existing_users]
+        )
+
+    base_index = pd.Index(
+        user_ids.unique(),
+        name=cfg.ID_COL,
+    )
+
+    blocks = []
+
+    # =========================================================
+    # 1. BASIC LIFETIME
+    # =========================================================
+
+    last_seen = hist.groupby(cfg.ID_COL)[cfg.DATE_COL].max()
+    first_seen = hist.groupby(cfg.ID_COL)[cfg.DATE_COL].min()
+
+    active_days = (
+        hist.groupby(cfg.ID_COL)[cfg.DATE_COL]
+        .nunique()
+    )
+
+    life = pd.DataFrame(index=base_index)
+
+    life["recency_days"] = (
+        cutoff_ts - last_seen
+    ).dt.days
+
+    life["tenure_days"] = (
+        cutoff_ts - first_seen
+    ).dt.days + 1
+
+    life["n_active_days_total"] = active_days
+
+    life["activity_density_total"] = safe_div(
+        life["n_active_days_total"],
+        life["tenure_days"],
+    )
+
+    # log versions
+    life["log_tenure_days"] = np.log1p(
+        life["tenure_days"].clip(lower=0)
+    )
+
+    life["log_recency_days"] = np.log1p(
+        life["recency_days"].clip(lower=0)
+    )
+
+    blocks.append(life)
+
+    # =========================================================
+    # 2. PURCHASE HISTORY
+    # =========================================================
+
+    purchases = hist[hist["gmv"] > 0].copy()
+
+    purch = pd.DataFrame(index=base_index)
+
     if len(purchases):
-        p = purchases.sort_values([cfg.ID_COL, cfg.DATE_COL]).copy()
-        p["prev_purchase_date"] = p.groupby(cfg.ID_COL)[cfg.DATE_COL].shift(1)
-        p["gap"] = (p[cfg.DATE_COL] - p["prev_purchase_date"]).dt.days
-        gap_stats = p.groupby(cfg.ID_COL)["gap"].agg(
-            mean_purchase_gap="mean", std_purchase_gap="std", n_purchase_days="count"
-        ).reset_index()
-        feats = feats.merge(gap_stats, on=cfg.ID_COL, how="left")
-    else:
-        feats["mean_purchase_gap"] = np.nan
-        feats["std_purchase_gap"] = np.nan
-        feats["n_purchase_days"] = 0
 
-    # -----------------------------------------------------------------
-    # 4) Лукбэк-агрегаты: суммы/средние по окнам [cutoff-L+1, cutoff]
-    # -----------------------------------------------------------------
+        last_purchase = (
+            purchases.groupby(cfg.ID_COL)[cfg.DATE_COL]
+            .max()
+        )
+
+        first_purchase = (
+            purchases.groupby(cfg.ID_COL)[cfg.DATE_COL]
+            .min()
+        )
+
+        n_purchase_days = (
+            purchases.groupby(cfg.ID_COL)[cfg.DATE_COL]
+            .nunique()
+        )
+
+        total_gmv = (
+            purchases.groupby(cfg.ID_COL)["gmv"]
+            .sum()
+        )
+
+        purch["recency_purchase_days"] = (
+            cutoff_ts - last_purchase
+        ).dt.days
+
+        purch["first_purchase_days"] = (
+            cutoff_ts - first_purchase
+        ).dt.days
+
+        purch["n_purchase_days"] = n_purchase_days
+
+        purch["total_purchase_gmv"] = total_gmv
+
+        purch["purchase_frequency"] = safe_div(
+            n_purchase_days,
+            purch["tenure_days"]
+            if "tenure_days" in purch.columns
+            else 1,
+        )
+
+        # gaps
+        p = purchases.sort_values(
+            [cfg.ID_COL, cfg.DATE_COL]
+        )
+
+        p["prev_date"] = (
+            p.groupby(cfg.ID_COL)[cfg.DATE_COL]
+            .shift(1)
+        )
+
+        p["gap"] = (
+            p[cfg.DATE_COL] - p["prev_date"]
+        ).dt.days
+
+        gaps = (
+            p.groupby(cfg.ID_COL)["gap"]
+            .agg(
+                mean_purchase_gap="mean",
+                std_purchase_gap="std",
+                min_purchase_gap="min",
+                max_purchase_gap="max",
+            )
+        )
+
+        purch = purch.join(gaps)
+
+    blocks.append(purch)
+
+    # =========================================================
+    # 3. LOOKBACK FEATURES
+    # =========================================================
+
     agg_cols = cfg.COUNT_COLS + cfg.GMV_COLS
+
+    lookbacks = {}
+
     for L in cfg.LOOKBACKS:
-        window_start = cutoff_ts - pd.Timedelta(days=L - 1)
-        w = hist[hist[cfg.DATE_COL] >= window_start]
-        if len(w) == 0:
-            g = pd.DataFrame({cfg.ID_COL: []})
-        else:
-            g = w.groupby(cfg.ID_COL)[agg_cols].sum()
-            g[f"n_active_days_{L}d"] = w.groupby(cfg.ID_COL)[cfg.DATE_COL].nunique()
-            g[f"n_purchase_days_{L}d"] = (
-                w[w["gmv"] > 0].groupby(cfg.ID_COL)[cfg.DATE_COL].nunique()
-                if (w["gmv"] > 0).any() else 0
-            )
-            g = g.rename(columns={c: f"{c}_sum_{L}d" for c in agg_cols})
-            g = g.reset_index()
-        feats = feats.merge(g, on=cfg.ID_COL, how="left")
 
-    # -----------------------------------------------------------------
-    # 5) Производные (rate/conversion) фичи по каждому лукбэку
-    # -----------------------------------------------------------------
+        start = cutoff_ts - pd.Timedelta(days=L - 1)
+
+        w = hist[
+            hist[cfg.DATE_COL] >= start
+        ]
+
+        g = pd.DataFrame(index=base_index)
+
+        if len(w):
+
+            sums = (
+                w.groupby(cfg.ID_COL)[agg_cols]
+                .sum()
+            )
+
+            sums.columns = [
+                f"{c}_sum_{L}d"
+                for c in sums.columns
+            ]
+
+            g = g.join(sums)
+
+            active = (
+                w.groupby(cfg.ID_COL)[cfg.DATE_COL]
+                .nunique()
+                .rename(
+                    f"n_active_days_{L}d"
+                )
+            )
+
+            g = g.join(active)
+
+            purchase_w = w[w["gmv"] > 0]
+
+            if len(purchase_w):
+
+                p_days = (
+                    purchase_w.groupby(cfg.ID_COL)[
+                        cfg.DATE_COL
+                    ]
+                    .nunique()
+                    .rename(
+                        f"n_purchase_days_{L}d"
+                    )
+                )
+
+                g = g.join(p_days)
+
+        lookbacks[L] = g
+
+        blocks.append(g)
+
+    # =========================================================
+    # 4. BTYD
+    # =========================================================
+
+    btyd = calculate_btyd_features(
+        df,
+        cutoff,
+        user_ids=base_index,
+    )
+
+    btyd = btyd.set_index(cfg.ID_COL)
+
+    blocks.append(
+        btyd.reindex(base_index)
+    )
+
+    # =========================================================
+    # 5. EMA
+    # =========================================================
+
+    ema = pd.DataFrame(index=base_index)
+
+    for w_days in [7, 14, 30, 60, 90]:
+
+        start = cutoff_ts - pd.Timedelta(
+            days=w_days - 1
+        )
+
+        sub = hist[
+            hist[cfg.DATE_COL] >= start
+        ].copy()
+
+        if len(sub):
+
+            age = (
+                cutoff_ts - sub[cfg.DATE_COL]
+            ).dt.days
+
+            sub["decay"] = np.exp(
+                -np.log(2) * age / max(w_days, 1)
+            )
+
+            sub["weighted_gmv"] = (
+                sub["gmv"] * sub["decay"]
+            )
+
+            value = (
+                sub.groupby(cfg.ID_COL)[
+                    "weighted_gmv"
+                ]
+                .sum()
+                .rename(
+                    f"ema_gmv_{w_days}d"
+                )
+            )
+
+            ema = ema.join(value)
+
+    blocks.append(ema)
+
+    # =========================================================
+    # 6. ASSEMBLE
+    # =========================================================
+
+    feats = pd.concat(
+        blocks,
+        axis=1,
+    )
+
+    feats = feats.reset_index()
+
+    # =========================================================
+    # 7. RATIOS
+    # =========================================================
+
     for L in cfg.LOOKBACKS:
-        gmv_col = f"gmv_sum_{L}d"
-        to_ord_col = f"to_ord_sum_{L}d"
-        to_cart_col = f"to_cart_sum_{L}d"
-        searches_col = f"searches_sum_{L}d"
-        active_days_col = f"n_active_days_{L}d"
 
-        if gmv_col in feats:
-            feats[f"gmv_per_active_day_{L}d"] = (
-                feats[gmv_col] / feats[active_days_col].clip(lower=1)
-            )
-            feats[f"avg_order_value_{L}d"] = (
-                feats[gmv_col] / feats[to_ord_col].clip(lower=1)
-            )
-            feats[f"cart_to_order_rate_{L}d"] = (
-                feats[to_ord_col] / feats[to_cart_col].clip(lower=1)
-            )
-            feats[f"search_to_cart_rate_{L}d"] = (
-                feats[to_cart_col] / feats[searches_col].clip(lower=1)
-            )
-            feats[f"activity_density_{L}d"] = feats[active_days_col] / L
+        def col(name):
+            return f"{name}_sum_{L}d"
 
-    # -----------------------------------------------------------------
-    # 6) Momentum: сравнение "последние 7д" vs "предыдущие 7д" (14д окно)
-    # -----------------------------------------------------------------
-    if "gmv_sum_7d" in feats and "gmv_sum_14d" in feats:
-        prev7_gmv = (feats["gmv_sum_14d"] - feats["gmv_sum_7d"]).clip(lower=0)
-        feats["gmv_momentum_7v7"] = feats["gmv_sum_7d"] - prev7_gmv
-        feats["gmv_momentum_ratio_7v7"] = feats["gmv_sum_7d"] / (prev7_gmv + 1.0)
+        gmv = col("gmv")
 
-    if "to_ord_sum_7d" in feats and "to_ord_sum_14d" in feats:
-        prev7_ord = (feats["to_ord_sum_14d"] - feats["to_ord_sum_7d"]).clip(lower=0)
-        feats["order_momentum_7v7"] = feats["to_ord_sum_7d"] - prev7_ord
+        orders = col("to_ord")
 
-    # -----------------------------------------------------------------
-    # 7) Заполнение пропусков
-    # -----------------------------------------------------------------
-    fill_zero_cols = [c for c in feats.columns if c.endswith(("d", "total")) and c != cfg.ID_COL]
-    for c in fill_zero_cols:
-        if c in feats.columns and feats[c].dtype != object:
+        cart = col("to_cart")
+
+        searches = col("searches")
+
+        active = f"n_active_days_{L}d"
+
+        purchase_days = f"n_purchase_days_{L}d"
+
+        if gmv in feats.columns:
+
+            if active in feats.columns:
+
+                feats[
+                    f"gmv_per_active_day_{L}d"
+                ] = safe_div(
+                    feats[gmv],
+                    feats[active],
+                )
+
+            if orders in feats.columns:
+
+                feats[
+                    f"avg_order_value_{L}d"
+                ] = safe_div(
+                    feats[gmv],
+                    feats[orders],
+                )
+
+            if purchase_days in feats.columns:
+
+                feats[
+                    f"gmv_per_purchase_day_{L}d"
+                ] = safe_div(
+                    feats[gmv],
+                    feats[purchase_days],
+                )
+
+        if orders in feats.columns and cart in feats.columns:
+
+            feats[
+                f"cart_to_order_rate_{L}d"
+            ] = safe_div(
+                feats[orders],
+                feats[cart],
+            )
+
+        if cart in feats.columns and searches in feats.columns:
+
+            feats[
+                f"search_to_cart_rate_{L}d"
+            ] = safe_div(
+                feats[cart],
+                feats[searches],
+            )
+
+        if active in feats.columns:
+
+            feats[
+                f"activity_density_{L}d"
+            ] = safe_div(
+                feats[active],
+                L,
+            )
+
+    # =========================================================
+    # 8. CROSS-WINDOW DYNAMICS
+    # =========================================================
+
+    windows = cfg.LOOKBACKS
+
+    for short, long in [
+        (7, 30),
+        (14, 30),
+        (30, 60),
+        (30, 90),
+        (60, 180),
+        (90, 365),
+    ]:
+
+        if (
+            f"gmv_sum_{short}d" in feats.columns
+            and f"gmv_sum_{long}d" in feats.columns
+        ):
+
+            feats[
+                f"gmv_ratio_{short}_{long}"
+            ] = safe_div(
+                feats[f"gmv_sum_{short}d"],
+                feats[f"gmv_sum_{long}d"],
+            )
+
+        if (
+            f"to_ord_sum_{short}d" in feats.columns
+            and f"to_ord_sum_{long}d" in feats.columns
+        ):
+
+            feats[
+                f"orders_ratio_{short}_{long}"
+            ] = safe_div(
+                feats[f"to_ord_sum_{short}d"],
+                feats[f"to_ord_sum_{long}d"],
+            )
+
+        if (
+            f"n_purchase_days_{short}d" in feats.columns
+            and f"n_purchase_days_{long}d" in feats.columns
+        ):
+
+            feats[
+                f"purchase_days_ratio_{short}_{long}"
+            ] = safe_div(
+                feats[
+                    f"n_purchase_days_{short}d"
+                ],
+                feats[
+                    f"n_purchase_days_{long}d"
+                ],
+            )
+
+    # =========================================================
+    # 9. RECENT VS OLD
+    # =========================================================
+
+    if (
+        "gmv_sum_30d" in feats.columns
+        and "gmv_sum_90d" in feats.columns
+    ):
+
+        feats["gmv_old_60d"] = (
+            feats["gmv_sum_90d"]
+            - feats["gmv_sum_30d"]
+        ).clip(lower=0)
+
+        feats["gmv_recent_share"] = safe_div(
+            feats["gmv_sum_30d"],
+            feats["gmv_sum_90d"],
+        )
+
+    if (
+        "to_ord_sum_30d" in feats.columns
+        and "to_ord_sum_90d" in feats.columns
+    ):
+
+        feats["orders_old_60d"] = (
+            feats["to_ord_sum_90d"]
+            - feats["to_ord_sum_30d"]
+        ).clip(lower=0)
+
+        feats["orders_recent_share"] = safe_div(
+            feats["to_ord_sum_30d"],
+            feats["to_ord_sum_90d"],
+        )
+
+    # =========================================================
+    # 10. LOG FEATURES
+    # =========================================================
+
+    numeric_cols = feats.select_dtypes(
+        include=[np.number]
+    ).columns
+
+    for c in numeric_cols:
+
+        if c == cfg.ID_COL:
+            continue
+
+        if (
+            "log_" not in c
+            and not c.startswith("target")
+        ):
+
+            feats[f"log1p_{c}"] = np.log1p(
+                np.clip(
+                    feats[c].astype("float64"),
+                    0,
+                    None,
+                )
+            ).astype("float32")
+
+    # =========================================================
+    # 11. MISSING VALUES
+    # =========================================================
+
+    for c in feats.columns:
+
+        if c in (cfg.ID_COL, "cutoff_date"):
+            continue
+
+        if pd.api.types.is_numeric_dtype(
+            feats[c]
+        ):
+
+            feats[c] = feats[c].replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+
             feats[c] = feats[c].fillna(0)
 
-    # recency для тех, кто вообще не встречался - большое число (никогда не были активны)
-    max_possible_recency = (cutoff_ts - _to_ts(cfg.HIST_START)).days + 1
-    feats["recency_days"] = feats["recency_days"].fillna(max_possible_recency)
-    feats["recency_purchase_days"] = feats["recency_purchase_days"].fillna(max_possible_recency)
-    feats["mean_purchase_gap"] = feats["mean_purchase_gap"].fillna(-1)  # маркер "нет покупок"
-    feats["std_purchase_gap"] = feats["std_purchase_gap"].fillna(-1)
-
     feats["cutoff_date"] = cutoff_ts
-    feats = feats.copy()  # de-fragment после множества merge/insert
-    return feats
+
+    return optimize_dtypes(
+        feats.copy()
+    )
 
 
 def build_target(
@@ -168,12 +546,44 @@ def build_target(
     target_start: dt.date,
     target_end: dt.date,
 ) -> pd.DataFrame:
-    """Считает target = sum(gmv) за [target_start, target_end] на каждого юзера из user_ids."""
-    t_start_ts, t_end_ts = _to_ts(target_start), _to_ts(target_end)
-    window = df[(df[cfg.DATE_COL] >= t_start_ts) & (df[cfg.DATE_COL] <= t_end_ts)]
-    target = window.groupby(cfg.ID_COL)["gmv"].sum().rename("target").reset_index()
 
-    base = pd.DataFrame({cfg.ID_COL: user_ids.values}).drop_duplicates()
-    target = base.merge(target, on=cfg.ID_COL, how="left")
-    target["target"] = target["target"].fillna(0.0)
+    start = _to_ts(target_start)
+    end = _to_ts(target_end)
+
+    window = df[
+        (df[cfg.DATE_COL] >= start)
+        & (df[cfg.DATE_COL] <= end)
+    ]
+
+    target = (
+        window.groupby(cfg.ID_COL)["gmv"]
+        .sum()
+        .rename(cfg.TARGET_COL)
+        .reset_index()
+    )
+
+    base = pd.DataFrame(
+        {
+            cfg.ID_COL:
+                pd.Series(user_ids).unique()
+        }
+    )
+
+    target = base.merge(
+        target,
+        on=cfg.ID_COL,
+        how="left",
+    )
+
+    target[cfg.TARGET_COL] = (
+        target[cfg.TARGET_COL]
+        .fillna(0)
+        .clip(lower=0)
+        .astype("float32")
+    )
+
+    target[cfg.TARGET_LOG_COL] = np.log1p(
+        target[cfg.TARGET_COL]
+    ).astype("float32")
+
     return target
