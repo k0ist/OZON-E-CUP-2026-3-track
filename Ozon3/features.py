@@ -36,15 +36,27 @@ def build_features_for_cutoff(
     df: pd.DataFrame,
     cutoff: dt.date,
     user_ids: pd.Series | None = None,
+    include_unseen: bool = False,
 ) -> pd.DataFrame:
 
     cutoff_ts = _to_ts(cutoff)
 
-    hist = df[df[cfg.DATE_COL] <= cutoff_ts].copy()
+    # build_dataset.py passes an already cutoff-bounded frame.  Reuse it to
+    # avoid duplicating tens of millions of rows; keep the defensive filter
+    # for direct callers that pass a wider history.
+    if df.empty or df[cfg.DATE_COL].max() <= cutoff_ts:
+        hist = df
+    else:
+        hist = df.loc[df[cfg.DATE_COL] <= cutoff_ts]
 
     # ---------------------------------------------------------
     # 0. Пользователи, существовавшие к cutoff
     # ---------------------------------------------------------
+
+    existing_users = pd.Index(
+        hist[cfg.ID_COL].drop_duplicates(),
+        name=cfg.ID_COL,
+    )
 
     if user_ids is None:
 
@@ -56,13 +68,14 @@ def build_features_for_cutoff(
 
     else:
 
-        # КРИТИЧЕСКИ ВАЖНО:
-        # исключаем пользователей, которые ещё не появились
-        existing_users = set(hist[cfg.ID_COL].unique())
+        user_ids = pd.Series(user_ids).drop_duplicates()
 
-        user_ids = pd.Series(
-            [u for u in user_ids if u in existing_users]
-        )
+        # seen_only остаётся основной train-policy. Для test и отдельного
+        # controlled experiment можно сохранить всю заданную популяцию;
+        # индикатор seen_before_anchor отличает cold-start строки от нулевой
+        # активности уже известного пользователя.
+        if not include_unseen:
+            user_ids = user_ids[user_ids.isin(existing_users)]
 
     base_index = pd.Index(
         user_ids.unique(),
@@ -84,6 +97,8 @@ def build_features_for_cutoff(
     )
 
     life = pd.DataFrame(index=base_index)
+
+    life["seen_before_anchor"] = base_index.isin(existing_users).astype("int8")
 
     life["recency_days"] = (
         cutoff_ts - last_seen
@@ -155,13 +170,13 @@ def build_features_for_cutoff(
 
         purch["purchase_frequency"] = safe_div(
             n_purchase_days,
-            purch["tenure_days"]
-            if "tenure_days" in purch.columns
-            else 1,
+            life["tenure_days"].reindex(n_purchase_days.index),
         )
 
         # gaps
-        p = purchases.sort_values(
+        p = purchases[
+            [cfg.ID_COL, cfg.DATE_COL]
+        ].drop_duplicates().sort_values(
             [cfg.ID_COL, cfg.DATE_COL]
         )
 
@@ -249,6 +264,21 @@ def build_features_for_cutoff(
         lookbacks[L] = g
 
         blocks.append(g)
+
+    # Exact previous 14-day block for a compact disjoint trend group.
+    # Other previous windows can be derived exactly from the cumulative
+    # 7/14/30/60/90-day aggregates below.
+    prev14 = hist[
+        (hist[cfg.DATE_COL] >= cutoff_ts - pd.Timedelta(days=27))
+        & (hist[cfg.DATE_COL] <= cutoff_ts - pd.Timedelta(days=14))
+    ]
+    prev14_block = pd.DataFrame(index=base_index)
+    trend_base_cols = ["gmv", "to_ord", "searches"]
+    if len(prev14):
+        prev14_sums = prev14.groupby(cfg.ID_COL)[trend_base_cols].sum()
+        prev14_sums.columns = [f"{c}_sum_prev_14d" for c in trend_base_cols]
+        prev14_block = prev14_block.join(prev14_sums)
+    blocks.append(prev14_block)
 
     # =========================================================
     # 4. BTYD
@@ -380,6 +410,15 @@ def build_features_for_cutoff(
                 feats[cart],
             )
 
+        if orders in feats.columns and searches in feats.columns:
+
+            feats[
+                f"search_to_order_rate_{L}d"
+            ] = safe_div(
+                feats[orders],
+                feats[searches],
+            )
+
         if cart in feats.columns and searches in feats.columns:
 
             feats[
@@ -397,6 +436,15 @@ def build_features_for_cutoff(
                 feats[active],
                 L,
             )
+
+            if purchase_days in feats.columns:
+
+                feats[
+                    f"purchase_day_share_{L}d"
+                ] = safe_div(
+                    feats[purchase_days],
+                    feats[active],
+                )
 
     # =========================================================
     # 8. CROSS-WINDOW DYNAMICS
@@ -488,12 +536,77 @@ def build_features_for_cutoff(
         )
 
     # =========================================================
-    # 10. LOG FEATURES
+    # 10. DISJOINT TEMPORAL TRENDS
     # =========================================================
 
+    # Consolidate blocks accumulated by the ratio section before adding the
+    # compact trend group. This avoids pandas block fragmentation on full data.
+    feats = feats.copy()
+
+    for signal in trend_base_cols:
+        recent_7 = f"{signal}_sum_7d"
+        recent_14 = f"{signal}_sum_14d"
+        recent_30 = f"{signal}_sum_30d"
+        total_60 = f"{signal}_sum_60d"
+        total_90 = f"{signal}_sum_90d"
+        previous_14 = f"{signal}_sum_prev_14d"
+
+        if recent_7 in feats and recent_14 in feats:
+            prev = (feats[recent_14] - feats[recent_7]).clip(lower=0)
+            feats[f"{signal}_sum_prev_7d"] = prev
+            feats[f"{signal}_delta_7_vs_prev7"] = (
+                feats[recent_7] - prev
+            ) / 7.0
+            feats[f"{signal}_ratio_7_vs_prev7"] = safe_div(
+                feats[recent_7] + 1.0,
+                prev + 1.0,
+            )
+
+        if recent_14 in feats and previous_14 in feats:
+            feats[f"{signal}_delta_14_vs_prev14"] = (
+                feats[recent_14] - feats[previous_14]
+            ) / 14.0
+            feats[f"{signal}_ratio_14_vs_prev14"] = safe_div(
+                feats[recent_14] + 1.0,
+                feats[previous_14] + 1.0,
+            )
+
+        if recent_30 in feats and total_60 in feats:
+            prev_30 = (feats[total_60] - feats[recent_30]).clip(lower=0)
+            feats[f"{signal}_sum_prev_30d"] = prev_30
+            feats[f"{signal}_delta_30_vs_prev30"] = (
+                feats[recent_30] - prev_30
+            ) / 30.0
+            feats[f"{signal}_ratio_30_vs_prev30"] = safe_div(
+                feats[recent_30] + 1.0,
+                prev_30 + 1.0,
+            )
+
+        if recent_30 in feats and total_60 in feats and total_90 in feats:
+            prev_30 = (feats[total_60] - feats[recent_30]).clip(lower=0)
+            older_30 = (feats[total_90] - feats[total_60]).clip(lower=0)
+            prev_60 = (feats[total_90] - feats[recent_30]).clip(lower=0)
+            feats[f"{signal}_sum_prev_60d"] = prev_60
+            feats[f"{signal}_delta_30_vs_prev60"] = (
+                feats[recent_30] / 30.0 - prev_60 / 60.0
+            )
+            feats[f"{signal}_slope_3x30"] = (
+                feats[recent_30] - older_30
+            ) / 60.0
+            feats[f"{signal}_acceleration_3x30"] = (
+                feats[recent_30] - 2.0 * prev_30 + older_30
+            ) / 30.0
+
+    # =========================================================
+    # 11. LOG FEATURES
+    # =========================================================
+
+    feats = feats.copy()
     numeric_cols = feats.select_dtypes(
         include=[np.number]
     ).columns
+
+    log_features = {}
 
     for c in numeric_cols:
 
@@ -503,9 +616,13 @@ def build_features_for_cutoff(
         if (
             "log_" not in c
             and not c.startswith("target")
+            and not any(
+                token in c
+                for token in ("delta_", "slope_", "acceleration_")
+            )
         ):
 
-            feats[f"log1p_{c}"] = np.log1p(
+            log_features[f"log1p_{c}"] = np.log1p(
                 np.clip(
                     feats[c].astype("float64"),
                     0,
@@ -513,8 +630,18 @@ def build_features_for_cutoff(
                 )
             ).astype("float32")
 
+    if log_features:
+        feats = pd.concat(
+            [feats, pd.DataFrame(log_features, index=feats.index)],
+            axis=1,
+        )
+
+    # The returned frame is reused by dataset assembly; consolidate it once so
+    # adding metadata does not trigger thousands of fragmented pandas blocks.
+    feats = feats.copy()
+
     # =========================================================
-    # 11. MISSING VALUES
+    # 12. MISSING VALUES
     # =========================================================
 
     for c in feats.columns:
@@ -533,11 +660,42 @@ def build_features_for_cutoff(
 
             feats[c] = feats[c].fillna(0)
 
-    feats["cutoff_date"] = cutoff_ts
+    feats = pd.concat(
+        [
+            feats,
+            pd.Series(cutoff_ts, index=feats.index, name="cutoff_date"),
+        ],
+        axis=1,
+    )
 
     return optimize_dtypes(
         feats.copy()
     )
+
+
+def feature_group_for_column(column: str) -> str:
+    """Stable, target-free grouping used by ablations and diagnostics."""
+    raw = column.removeprefix("log1p_")
+    if raw.startswith("btyd_"):
+        return "btyd"
+    if any(token in raw for token in ("delta_", "ratio_7_vs", "ratio_14_vs", "ratio_30_vs", "slope_", "acceleration_", "sum_prev_")):
+        return "trend"
+    if "_rate_" in raw or "_ratio_" in raw or "_share_" in raw or raw.endswith("_share"):
+        return "ratio"
+    if any(token in raw for token in ("recency", "tenure", "purchase_frequency", "n_purchase_days", "n_active_days_total")):
+        return "rfm"
+    if any(token in raw for token in ("180d", "365d", "total_purchase", "purchase_gap")):
+        return "long_term"
+    if raw.startswith("ema_"):
+        return "trend"
+    return "window_aggregate"
+
+
+def get_feature_groups(feature_columns) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for column in feature_columns:
+        groups.setdefault(feature_group_for_column(column), []).append(column)
+    return groups
 
 
 def build_target(

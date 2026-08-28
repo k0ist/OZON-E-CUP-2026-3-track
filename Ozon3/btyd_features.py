@@ -22,6 +22,7 @@ def calculate_btyd_features(
     df: pd.DataFrame,
     cutoff: dt.date,
     user_ids=None,
+    backend: str | None = None,
 ) -> pd.DataFrame:
 
     cutoff_ts = pd.Timestamp(cutoff)
@@ -53,17 +54,37 @@ def calculate_btyd_features(
         hist["gmv"] > 0
     ].copy()
 
+    backend = backend or getattr(cfg, "BTYD_BACKEND", "fallback")
+    if backend not in {"fallback", "lifetimes"}:
+        raise ValueError(
+            f"Unknown BTYD backend={backend!r}; expected 'fallback' or 'lifetimes'."
+        )
+
     if len(orders) == 0:
 
-        result["btyd_p_alive"] = 0
-        result["btyd_exp_orders_30d"] = 0
-        result["btyd_exp_gmv_30d"] = 0
+        for column in (
+            "btyd_p_alive",
+            "btyd_exp_orders_30d",
+            "btyd_exp_gmv_30d",
+            "btyd_log_exp_orders",
+            "btyd_log_exp_gmv",
+            "btyd_order_value",
+            "btyd_total_gmv",
+        ):
+            result[column] = 0.0
 
         return result
 
     orders[cfg.DATE_COL] = pd.to_datetime(
         orders[cfg.DATE_COL]
     )
+
+    # BTYD transactions are unique positive-GMV purchase days.  The raw
+    # competition table is sparse daily activity, not an order-level table.
+    orders = orders.sort_values([cfg.ID_COL, cfg.DATE_COL])
+    first_purchase = orders.groupby(cfg.ID_COL)[cfg.DATE_COL].transform("min")
+    repeat_orders = orders[orders[cfg.DATE_COL] > first_purchase]
+    repeat_monetary = repeat_orders.groupby(cfg.ID_COL)["gmv"].mean()
 
     rfm = (
         orders.groupby(cfg.ID_COL)
@@ -80,7 +101,7 @@ def calculate_btyd_features(
                 cfg.DATE_COL,
                 "nunique",
             ),
-            monetary_value=(
+            mean_purchase_day_gmv=(
                 "gmv",
                 "mean",
             ),
@@ -106,11 +127,24 @@ def calculate_btyd_features(
         - rfm["first_order"]
     ).dt.days.clip(lower=0)
 
+    rfm["monetary_value"] = rfm[cfg.ID_COL].map(repeat_monetary)
+    rfm["monetary_value"] = rfm["monetary_value"].fillna(
+        rfm["mean_purchase_day_gmv"]
+    )
+
+    if (rfm["recency"] > rfm["T"]).any():
+        raise AssertionError("BTYD invariant violated: recency must not exceed T")
+
     # =========================================================
     # BASIC BTYD
     # =========================================================
 
-    if HAS_LIFETIMES:
+    if backend == "lifetimes":
+
+        if not HAS_LIFETIMES:
+            raise RuntimeError(
+                "BTYD_BACKEND='lifetimes', but the lifetimes package is not installed."
+            )
 
         try:
 
@@ -194,11 +228,10 @@ def calculate_btyd_features(
                     ]
                 )
 
-        except Exception:
-
-            rfm = _fallback_btyd(
-                rfm
-            )
+        except Exception as exc:
+            # A silent per-fold fallback changes feature semantics and makes
+            # OOF irreproducible. Fail loudly instead.
+            raise RuntimeError("lifetimes BTYD fit failed") from exc
 
     else:
 

@@ -6,24 +6,51 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 SUB_DIR = PROJECT_DIR / "submissions"
 UPLOADS_DIR = PROJECT_DIR / "uploads"
+MODELS_DIR = DATA_DIR / "models"
+OOF_DIR = DATA_DIR / "oof"
+REPORTS_DIR = PROJECT_DIR / "reports"
 
-for _d in (DATA_DIR, SUB_DIR, UPLOADS_DIR):
+# Only output directories are created automatically.  ``uploads`` is an input
+# directory and must not be silently created when the competition files are
+# missing.
+for _d in (DATA_DIR, SUB_DIR, MODELS_DIR, OOF_DIR, REPORTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-DATA_PATH = UPLOADS_DIR / "train.parquet"
-if not DATA_PATH.exists() and (UPLOADS_DIR / "train.csv").exists():
-    DATA_PATH = UPLOADS_DIR / "train.csv"
+TRAIN_DATA_CANDIDATES = (
+    UPLOADS_DIR / "train.parquet",
+    UPLOADS_DIR / "train.csv",
+)
+SAMPLE_SUBMISSION_CANDIDATES = (
+    UPLOADS_DIR / "sample_submit.csv",
+    UPLOADS_DIR / "sample_submission.csv",
+)
+
+
+def _first_existing(candidates: tuple[Path, ...]) -> Path:
+    """Return the first existing candidate, or the preferred path.
+
+    Existence is validated by the loader so importing config remains safe for
+    the synthetic-data generator.
+    """
+
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+DATA_PATH = _first_existing(TRAIN_DATA_CANDIDATES)
+SAMPLE_SUBMISSION_PATH = _first_existing(SAMPLE_SUBMISSION_CANDIDATES)
+SYNTHETIC_DATA_PATH = DATA_DIR / "synthetic_train.parquet"
+SYNTHETIC_SAMPLE_SUBMISSION_PATH = DATA_DIR / "synthetic_sample_submit.csv"
 
 if os.environ.get("ECUP_USE_SYNTHETIC") == "1":
-    DATA_PATH = DATA_DIR / "synthetic_train.parquet"
-
-SAMPLE_SUBMISSION_PATH = UPLOADS_DIR / "sample_submission.csv"
+    DATA_PATH = SYNTHETIC_DATA_PATH
+    SAMPLE_SUBMISSION_PATH = SYNTHETIC_SAMPLE_SUBMISSION_PATH
 
 HIST_START = dt.date(2025, 1, 1)
 HIST_END = dt.date(2026, 2, 13)
 TARGET_START = dt.date(2026, 2, 14)
 TARGET_END = dt.date(2026, 3, 15)
 TARGET_LEN_DAYS = (TARGET_END - TARGET_START).days + 1
+EXPECTED_SUBMISSION_ROWS = 250_000
 
 ID_COL = "user_id"
 DATE_COL = "event_date"
@@ -67,3 +94,9 @@ ALL_NUMERIC_COLS = FLAG_COLS + COUNT_COLS + GMV_COLS
 LOOKBACKS = [7, 14, 30, 60, 90, 180, 365]
 
 RANDOM_STATE = 42
+BTYD_BACKEND = os.environ.get("ECUP_BTYD_BACKEND", "fallback")
+if BTYD_BACKEND not in {"fallback", "lifetimes"}:
+    raise ValueError(
+        "ECUP_BTYD_BACKEND must be either 'fallback' or 'lifetimes', "
+        f"got {BTYD_BACKEND!r}."
+    )
