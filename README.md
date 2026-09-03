@@ -497,19 +497,19 @@ OZON/
 
 #  Описание файлов
 
-  Файл                 Назначение
-  -------------------- ---------------------------------
-  `config.py`          Конфигурация проекта
-  `data_loading.py`    Загрузка исходных данных
-  `features.py`        Feature Engineering
-  `btyd_features.py`   BG/NBD + Gamma-Gamma
-  `time_split.py`      Temporal CV
-  `build_dataset.py`   Создание CV/test датасетов
-  `train.py`           Обучение LightGBM
-  `train_cb.py`        Обучение CatBoost
-  `tune.py`            Эксперименты с гиперпараметрами
-  `predict.py`         Получение предсказаний
-  `Ensemble.ipynb`     Blending моделей
+ | Файл               | Назначение                      |
+| ------------------ | ------------------------------- |
+| `config.py`        | Конфигурация проекта            |
+| `data_loading.py`  | Загрузка исходных данных        |
+| `features.py`      | Feature Engineering             |
+| `btyd_features.py` | BG/NBD + Gamma-Gamma            |
+| `time_split.py`    | Temporal CV                     |
+| `build_dataset.py` | Создание CV/test датасетов      |
+| `train.py`         | Обучение LightGBM               |
+| `train_cb.py`      | Обучение CatBoost               |
+| `tune.py`          | Эксперименты с гиперпараметрами |
+| `predict.py`       | Получение предсказаний          |
+| `Ensemble.ipynb`   | Blending моделей                |
 
 ------------------------------------------------------------------------
 
